@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import zipfile
 
@@ -308,6 +309,18 @@ def _validate_batch_entry_count(items, noun="entries"):
 DEPLOY_SUBPROCESS_TIMEOUT_SECONDS = int(
     os.getenv("NOTEBOOK_API_DEPLOY_TIMEOUT_SECONDS", "600")
 )
+
+# How long POST /api/deploy's own optional "smoke_test" (see
+# _run_deploy_smoke_test below) waits for the just-built image's own
+# container to start responding to GET /health before giving up. Same
+# NOTEBOOK_API_* convention as DEPLOY_SUBPROCESS_TIMEOUT_SECONDS above,
+# independently configurable since a slow-starting app (heavy imports at
+# module load time, a large model loaded eagerly) legitimately needs
+# longer than a fast one to become ready.
+DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS = float(
+    os.getenv("NOTEBOOK_API_DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS", "30")
+)
+_DEPLOY_SMOKE_TEST_POLL_INTERVAL_SECONDS = 0.5
 
 # Same NOTEBOOK_API_* convention as MAX_NOTEBOOK_VERSIONS below. Without a
 # cap, a dashboard's own deploy history (see _append_deploy_history_entry
@@ -11955,6 +11968,182 @@ def _run_docker_command(args, cwd):
         )
 
 
+def _run_deploy_smoke_test(tag, cwd):
+    """Actually run the just-built `tag` image in a real, throwaway
+    container and poll its own GET /health until it responds (or
+    DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS elapses), for POST /api/deploy's
+    own optional "smoke_test" below -- catching a class of failure
+    _run_compile_smoke_test's own docstring already says it can't:
+    that one only ever imports the compiled app inside *this dashboard
+    process's own* Python environment, never inside a fresh container
+    built from the exact requirements.txt this compile pinned. A system
+    library the base image is missing, a `pip install` that behaves
+    differently inside the container's own environment, or a Dockerfile
+    bug that only manifests once the image actually runs (a bad CMD, a
+    port the app doesn't actually bind to) -- a successful `docker build`
+    alone catches none of these; only actually running the image does.
+
+    Returns {"passed": bool, "status_code": int | None, "detail": str |
+    None} -- never raises. A failed smoke test does not mean the deploy
+    itself failed: the image is still built (and, with "push": true,
+    still pushed) exactly as it would be without this -- this is a
+    diagnostic on top of an already-successful build, not a retroactive
+    verdict on it, the identical "diagnostic, not gating" relationship
+    _run_compile_smoke_test's own docstring already establishes between
+    a failed smoke test and an already-successful compile.
+
+    Binds the container's own port 8000 (the Dockerfile's own EXPOSE,
+    and what its CMD binds to when $PORT isn't set -- neither `docker
+    run` invocation below sets one) to an ephemeral host port
+    ("-p 127.0.0.1::8000", an empty host port before the colon) rather
+    than a fixed one, so two smoke tests -- or a smoke test racing an
+    unrelated process already bound to a fixed port -- can never collide.
+    "--rm" removes the container as soon as it stops, so a failed smoke
+    test never leaves a stopped container behind to clean up by hand.
+    """
+    try:
+
+        run_result = subprocess.run(
+            ["docker", "run", "-d", "--rm", "-p", "127.0.0.1::8000", tag],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=DEPLOY_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+
+    except FileNotFoundError:
+
+        return {
+            "passed": False,
+            "status_code": None,
+            "detail": "Docker CLI not found on the server.",
+        }
+
+    except subprocess.TimeoutExpired:
+
+        return {
+            "passed": False,
+            "status_code": None,
+            "detail": (
+                "`docker run` did not finish within "
+                f"{DEPLOY_SUBPROCESS_TIMEOUT_SECONDS} seconds."
+            ),
+        }
+
+    if run_result.returncode != 0:
+
+        return {
+            "passed": False,
+            "status_code": None,
+            "detail": f"Docker run failed: {run_result.stderr.strip()}",
+        }
+
+    container_id = run_result.stdout.strip()
+
+    try:
+
+        return _poll_deploy_smoke_test_container(container_id)
+
+    finally:
+
+        # Best-effort: "--rm" above already removes the container once it
+        # stops on its own, but a still-running container (the common
+        # case -- a healthy app just keeps serving until told to stop)
+        # needs an explicit stop or it would otherwise keep running,
+        # bound to its ephemeral port, forever.
+        subprocess.run(
+            ["docker", "stop", container_id],
+            capture_output=True,
+            text=True,
+            timeout=DEPLOY_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+
+
+def _poll_deploy_smoke_test_container(container_id):
+    """The actual GET /health polling loop _run_deploy_smoke_test above
+    delegates to, once its own container is already running -- split out
+    so that function's own `finally: docker stop` always runs, whether
+    this returns normally or raises.
+
+    `docker port` (not a value already known ahead of time) is how the
+    ephemeral host port _run_deploy_smoke_test's own "-p 127.0.0.1::8000"
+    was actually assigned is discovered -- Docker doesn't report it back
+    from `docker run` itself.
+    """
+    port_result = subprocess.run(
+        ["docker", "port", container_id, "8000/tcp"],
+        capture_output=True,
+        text=True,
+        timeout=DEPLOY_SUBPROCESS_TIMEOUT_SECONDS,
+    )
+
+    if port_result.returncode != 0:
+
+        return {
+            "passed": False,
+            "status_code": None,
+            "detail": f"Could not determine the container's own port: {port_result.stderr.strip()}",
+        }
+
+    # "docker port" prints one "host:port" (or "host:port\n" for more
+    # than one mapping, e.g. an IPv4 and an IPv6 listener) -- the first
+    # line is always the one this container's own single "-p" mapping
+    # above produced.
+    host_port = port_result.stdout.strip().splitlines()[0]
+
+    deadline = time.monotonic() + DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS
+    last_status_code = None
+    last_error = None
+
+    while time.monotonic() < deadline:
+
+        try:
+
+            response = httpx.get(f"http://{host_port}/health", timeout=2)
+
+        except httpx.HTTPError as e:
+
+            last_error = str(e)
+
+        else:
+
+            last_status_code = response.status_code
+
+            if response.status_code == 200:
+
+                return {
+                    "passed": True,
+                    "status_code": 200,
+                    "detail": None,
+                }
+
+        time.sleep(_DEPLOY_SMOKE_TEST_POLL_INTERVAL_SECONDS)
+
+    logs_result = subprocess.run(
+        ["docker", "logs", container_id],
+        capture_output=True,
+        text=True,
+        timeout=DEPLOY_SUBPROCESS_TIMEOUT_SECONDS,
+    )
+    container_logs = (logs_result.stdout + logs_result.stderr).strip()
+
+    if last_status_code is not None:
+        reason = f"GET /health last responded {last_status_code}"
+    elif last_error is not None:
+        reason = f"GET /health never responded: {last_error}"
+    else:
+        reason = "GET /health was never reached"
+
+    return {
+        "passed": False,
+        "status_code": last_status_code,
+        "detail": (
+            f"{reason} within {DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS}s. "
+            f"Container logs:\n{container_logs}"
+        ),
+    }
+
+
 @router.post("/deploy")
 def deploy_generated_app(data: dict = None):
     """Build (and optionally push) a Docker image from the compiled app.
@@ -12024,6 +12213,24 @@ def deploy_generated_app(data: dict = None):
     dropping to a shell on the server and running `docker build
     --no-cache` directly in GENERATED_DIR, bypassing this dashboard's own
     deploy history/staleness-check machinery entirely.
+
+    "smoke_test" (optional, default false) additionally runs the just-
+    built image in a real, throwaway container (see
+    _run_deploy_smoke_test) and polls its own GET /health until it
+    responds, adding a "smoke_test": {"passed", "status_code", "detail"}
+    field to the response -- catching a class of failure POST
+    /api/compile's own identically-named "smoke_test" cannot: that one
+    only ever imports the compiled app inside *this dashboard process's
+    own* Python environment, never inside a fresh container built from
+    the exact requirements.txt this compile pinned, so a missing system
+    library, a container-only `pip install` failure, or a Dockerfile bug
+    that only manifests once the image actually runs would all pass it
+    cleanly. Purely diagnostic, like that one -- a failed smoke test
+    never blocks (or undoes) an already-successful build, and still
+    doesn't block "push": true from publishing it; the same "diagnostic,
+    not gating" relationship POST /api/compile's own "smoke_test"
+    already has with a successful compile. Skipped entirely under
+    "dry_run": true, since there is no built image yet to run.
     """
 
     generated_path = Path(GENERATED_DIR)
@@ -12064,6 +12271,7 @@ def deploy_generated_app(data: dict = None):
         )
 
     no_cache = bool(data.get("no_cache", False))
+    smoke_test = bool(data.get("smoke_test", False))
 
     # `docker build`'s own default target platform is whatever the local
     # Docker daemon's host architecture is -- correct for a plain `docker
@@ -12148,6 +12356,9 @@ def deploy_generated_app(data: dict = None):
         "tag": tag,
         "pushed": False,
     }
+
+    if smoke_test:
+        response["smoke_test"] = _run_deploy_smoke_test(tag, generated_path)
 
     if push:
 

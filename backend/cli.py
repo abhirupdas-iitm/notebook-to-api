@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # ValidationError is the exception nbformat raises for a syntactically valid
@@ -388,6 +389,15 @@ DEPLOY_SUBPROCESS_TIMEOUT_SECONDS = int(
     os.getenv("NOTEBOOK_API_DEPLOY_TIMEOUT_SECONDS", "600")
 )
 
+# Same NOTEBOOK_API_DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS env var POST
+# /api/deploy's own "smoke_test" already reads (see
+# DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS in routes/upload.py), so one setting
+# controls both surfaces consistently.
+DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS = float(
+    os.getenv("NOTEBOOK_API_DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS", "30")
+)
+_DEPLOY_SMOKE_TEST_POLL_INTERVAL_SECONDS = 0.5
+
 
 def _fallback_openapi_export_path(openapi_path):
     """If `openapi_path` doesn't exist but a sibling OpenAPI export using
@@ -484,6 +494,154 @@ def _run_deploy_docker_command(args, cwd, capture_output=False):
         raise RuntimeError(
             "Docker CLI not found. Install Docker and ensure `docker` is on PATH to use `deploy`."
         ) from exc
+
+
+def _run_local_deploy_smoke_test(tag, cwd):
+    """`deploy --smoke-test`'s own local counterpart to
+    _run_deploy_smoke_test (backend/routes/upload.py) -- actually runs
+    the just-built `tag` image in a real, throwaway container and polls
+    its own GET /health until it responds (or
+    DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS elapses), catching a class of
+    failure `deploy`'s own successful `docker build` alone can't: a
+    system library the base image is missing, a `pip install` that
+    behaves differently inside the container's own environment, or a
+    Dockerfile bug that only manifests once the image actually runs.
+
+    Returns {"passed": bool, "status_code": int | None, "detail": str |
+    None} -- never raises, the identical "diagnostic, not gating"
+    contract _run_deploy_smoke_test/_run_local_compile_smoke_test already
+    establish: a failed smoke test does not mean the build (or an
+    already-requested push) failed or should be skipped.
+
+    Unlike _run_deploy_smoke_test, this can't rely on `docker`/`httpx`
+    already being imported at module scope the way the dashboard process
+    can -- imported here instead, the same deferred-import convention
+    every other command in this file already uses for a dependency (or,
+    for `time`, a subprocess invocation) not every invocation needs.
+    """
+    import httpx
+
+    try:
+
+        run_result = subprocess.run(
+            ["docker", "run", "-d", "--rm", "-p", "127.0.0.1::8000", tag],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=DEPLOY_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+
+    except FileNotFoundError:
+
+        return {
+            "passed": False,
+            "status_code": None,
+            "detail": "Docker CLI not found.",
+        }
+
+    except subprocess.TimeoutExpired:
+
+        return {
+            "passed": False,
+            "status_code": None,
+            "detail": (
+                "`docker run` did not finish within "
+                f"{DEPLOY_SUBPROCESS_TIMEOUT_SECONDS} seconds."
+            ),
+        }
+
+    if run_result.returncode != 0:
+
+        return {
+            "passed": False,
+            "status_code": None,
+            "detail": f"Docker run failed: {run_result.stderr.strip()}",
+        }
+
+    container_id = run_result.stdout.strip()
+
+    try:
+
+        port_result = subprocess.run(
+            ["docker", "port", container_id, "8000/tcp"],
+            capture_output=True,
+            text=True,
+            timeout=DEPLOY_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+
+        if port_result.returncode != 0:
+
+            return {
+                "passed": False,
+                "status_code": None,
+                "detail": (
+                    "Could not determine the container's own port: "
+                    f"{port_result.stderr.strip()}"
+                ),
+            }
+
+        host_port = port_result.stdout.strip().splitlines()[0]
+
+        deadline = time.monotonic() + DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS
+        last_status_code = None
+        last_error = None
+
+        while time.monotonic() < deadline:
+
+            try:
+
+                response = httpx.get(f"http://{host_port}/health", timeout=2)
+
+            except httpx.HTTPError as e:
+
+                last_error = str(e)
+
+            else:
+
+                last_status_code = response.status_code
+
+                if response.status_code == 200:
+
+                    return {
+                        "passed": True,
+                        "status_code": 200,
+                        "detail": None,
+                    }
+
+            time.sleep(_DEPLOY_SMOKE_TEST_POLL_INTERVAL_SECONDS)
+
+        logs_result = subprocess.run(
+            ["docker", "logs", container_id],
+            capture_output=True,
+            text=True,
+            timeout=DEPLOY_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        container_logs = (logs_result.stdout + logs_result.stderr).strip()
+
+        if last_status_code is not None:
+            reason = f"GET /health last responded {last_status_code}"
+        elif last_error is not None:
+            reason = f"GET /health never responded: {last_error}"
+        else:
+            reason = "GET /health was never reached"
+
+        return {
+            "passed": False,
+            "status_code": last_status_code,
+            "detail": (
+                f"{reason} within {DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS}s. "
+                f"Container logs:\n{container_logs}"
+            ),
+        }
+
+    finally:
+
+        subprocess.run(
+            ["docker", "stop", container_id],
+            capture_output=True,
+            text=True,
+            timeout=DEPLOY_SUBPROCESS_TIMEOUT_SECONDS,
+        )
 
 
 def _add_function_selection_arguments(parser):
@@ -1378,6 +1536,8 @@ def _dispatch_core_command(args):
             # own progress output off of --json's stdout, the same way
             # routes/upload.py's `_run_docker_command` already captures it
             # unconditionally for the identical operation.
+            smoke_test_result = None
+
             with contextlib.redirect_stdout(io.StringIO()):
                 compile_notebook(
                     notebook_path=args.notebook, output_dir=str(output_dir),
@@ -1393,10 +1553,14 @@ def _dispatch_core_command(args):
                     # to check -- without ever invoking `docker build`/
                     # `docker push` at all. "pushed" reports what a real
                     # run *would* do with --push, not that anything
-                    # actually happened.
+                    # actually happened. --smoke-test is ignored here too,
+                    # the same reasoning: there is no built image yet to
+                    # actually run.
                     pushed = args.push
                 else:
                     _run_deploy_docker_command(build_args, output_dir, capture_output=True)
+                    if args.smoke_test:
+                        smoke_test_result = _run_local_deploy_smoke_test(tag, output_dir)
                     pushed = False
                     if args.push:
                         _run_deploy_docker_command(
@@ -1407,7 +1571,12 @@ def _dispatch_core_command(args):
             result = {"status": "success", "tag": tag, "pushed": pushed}
             if args.dry_run:
                 result["dry_run"] = True
+            if smoke_test_result is not None:
+                result["smoke_test"] = smoke_test_result
             print(json.dumps(result, indent=2))
+
+            if smoke_test_result is not None and not smoke_test_result["passed"]:
+                sys.exit(1)
         else:
             compile_notebook(
                 notebook_path=args.notebook, output_dir=str(output_dir),
@@ -1428,10 +1597,22 @@ def _dispatch_core_command(args):
                 _run_deploy_docker_command(build_args, output_dir)
                 print(f"Docker image '{tag}' built successfully.")
 
+                smoke_test_result = None
+                if args.smoke_test:
+                    print("Running smoke test …")
+                    smoke_test_result = _run_local_deploy_smoke_test(tag, output_dir)
+                    if smoke_test_result["passed"]:
+                        print("Smoke test: passed (GET /health responded 200)")
+                    else:
+                        print(f"Smoke test: FAILED -- {smoke_test_result['detail']}")
+
                 if args.push:
                     print(f"Pushing Docker image '{tag}' …")
                     _run_deploy_docker_command(["docker", "push", tag], output_dir)
                     print(f"Docker image '{tag}' pushed successfully.")
+
+                if smoke_test_result is not None and not smoke_test_result["passed"]:
+                    sys.exit(1)
     elif args.command == "diff":
         diff = diff_notebook_functions(args.old_notebook, args.new_notebook)
         diff.update(classify_notebook_diff(diff))
@@ -5676,6 +5857,9 @@ def _dispatch_core_command(args):
         if args.dry_run:
             body["dry_run"] = True
 
+        if args.smoke_test:
+            body["smoke_test"] = True
+
         try:
             response = httpx.post(
                 f"{dashboard_url}/api/deploy", json=body, timeout=args.timeout,
@@ -5704,6 +5888,17 @@ def _dispatch_core_command(args):
                     "Would push to the registry." if data.get("dry_run")
                     else "Pushed to the registry."
                 )
+
+            smoke_test = data.get("smoke_test")
+
+            if smoke_test is not None:
+                if smoke_test["passed"]:
+                    print("\nSmoke test: passed (GET /health responded 200)")
+                else:
+                    print(f"\nSmoke test: FAILED -- {smoke_test.get('detail')}")
+
+        if data.get("smoke_test") is not None and not data["smoke_test"]["passed"]:
+            sys.exit(1)
     elif args.command == "deploy-history":
         # See `upload` above for why this is imported here rather than at
         # module scope.
@@ -6506,6 +6701,25 @@ def main():
         )
     )
     deploy_parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        dest="smoke_test",
+        help=(
+            "After a successful build, actually run the image in a real, "
+            "throwaway container and poll its own GET /health until it "
+            "responds -- catches a class of failure a successful `docker "
+            "build` alone can't (a missing system library, a `pip "
+            "install` that behaves differently inside the container's "
+            "own environment, a Dockerfile bug that only manifests once "
+            "the image actually runs), the same way `compile "
+            "--smoke-test` catches a codegen bug a successful compile "
+            "alone can't. The same \"smoke_test\" POST /api/deploy "
+            "itself performs. This command exits 1 if the smoke test "
+            "fails, even though the image was still built (and, with "
+            "--push, still pushed) successfully. Ignored under --dry-run."
+        )
+    )
+    deploy_parser.add_argument(
         "--json",
         action="store_true",
         dest="json_output",
@@ -6513,7 +6727,8 @@ def main():
             "Emit a machine-readable JSON result ({\"status\", \"tag\", "
             "\"pushed\"}) instead of human-readable progress output, for "
             "scripting/automation -- the same shape POST /api/deploy "
-            "already returns for the same operation."
+            "already returns for the same operation. Also includes "
+            "\"smoke_test\" when --smoke-test is given."
         )
     )
     _add_function_selection_arguments(deploy_parser)
@@ -10531,6 +10746,22 @@ def main():
             "history entry."
         )
     )
+    remote_deploy_parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        dest="smoke_test",
+        help=(
+            "After a successful build, have the dashboard actually run "
+            "the image in a real, throwaway container on its own host "
+            "and poll its own GET /health until it responds, via POST "
+            "/api/deploy's own \"smoke_test\" body field -- the same "
+            "\"smoke_test\" the local `deploy --smoke-test` performs, "
+            "just against the dashboard's own build instead. This "
+            "command exits 1 if the smoke test fails, even though the "
+            "image was still built (and, with --push, still pushed) "
+            "successfully. Ignored under --dry-run."
+        )
+    )
     # Docker builds routinely run well past this file's other commands'
     # own 30s default (see _add_dashboard_url_and_timeout_arguments) --
     # matched here to DEPLOY_SUBPROCESS_TIMEOUT_SECONDS's own 600s
@@ -10545,7 +10776,8 @@ def main():
         help=(
             "Emit the dashboard's own JSON response "
             "({\"status\", \"tag\", \"pushed\"}) instead of "
-            "human-readable progress output, for scripting/automation."
+            "human-readable progress output, for scripting/automation. "
+            "Also includes \"smoke_test\" when --smoke-test is given."
         )
     )
 

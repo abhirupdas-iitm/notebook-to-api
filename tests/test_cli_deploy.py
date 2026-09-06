@@ -1,9 +1,13 @@
+import http.server
 import json
 import os
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -121,6 +125,98 @@ def _install_fake_docker_recording_all_calls(bin_dir, log_path):
         encoding="utf-8",
     )
     docker_stub.chmod(docker_stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _install_fake_docker_with_smoke_test_support(bin_dir, log_path):
+    """Like _install_fake_docker_recording_all_calls, but also supports
+    `run`/`port`/`stop`/`logs` (for `deploy --smoke-test`'s own
+    _run_local_deploy_smoke_test) -- each subcommand's own behavior is
+    driven by environment variables a test sets before invoking `deploy`
+    (inherited by this subprocess, and by the further `docker ...`
+    subprocesses it launches in turn):
+
+      FAKE_DOCKER_RUN_EXIT_CODE (default 0), FAKE_DOCKER_RUN_STDOUT
+      (default "fake-container-id"), FAKE_DOCKER_RUN_STDERR (default "")
+      FAKE_DOCKER_PORT_EXIT_CODE (default 0), FAKE_DOCKER_PORT_STDOUT
+      (default "") -- a real test points this at a real local HTTP
+      server's own "127.0.0.1:<port>" (see fake_container_health_server
+      below) so the smoke test's own GET /health polling has something
+      real to actually reach.
+      FAKE_DOCKER_LOGS_STDOUT (default "") -- returned by `docker logs`,
+      surfaced in a failed smoke test's own "detail".
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text(
+        "#!/bin/sh\n"
+        f'{{ printf \'%s\\n\' "$@"; pwd; printf \'%s\\n\' "==CALL=="; }} >> "{log_path}"\n'
+        'case "$1" in\n'
+        "  run)\n"
+        '    printf \'%s\' "${FAKE_DOCKER_RUN_STDOUT:-fake-container-id}"\n'
+        '    printf \'%s\' "${FAKE_DOCKER_RUN_STDERR:-}" >&2\n'
+        '    exit "${FAKE_DOCKER_RUN_EXIT_CODE:-0}"\n'
+        "    ;;\n"
+        "  port)\n"
+        '    printf \'%s\' "${FAKE_DOCKER_PORT_STDOUT:-}"\n'
+        '    exit "${FAKE_DOCKER_PORT_EXIT_CODE:-0}"\n'
+        "    ;;\n"
+        "  stop)\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  logs)\n"
+        '    printf \'%s\' "${FAKE_DOCKER_LOGS_STDOUT:-}"\n'
+        "    exit 0\n"
+        "    ;;\n"
+        "  *)\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(docker_stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+class _SmokeTestHealthHandler(http.server.BaseHTTPRequestHandler):
+    """Stands in for the compiled app's own GET /health inside the
+    "container" `docker run` would otherwise have started for real --
+    fake_container_health_server below points the fake docker's own
+    "docker port" output at this real local server instead.
+    """
+
+    status_code = 200
+
+    def do_GET(self):
+
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        self.send_response(type(self).status_code)
+        body = b'{"status": "healthy"}'
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def fake_container_health_server():
+    _SmokeTestHealthHandler.status_code = 200
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _SmokeTestHealthHandler)
+    port = server.server_address[1]
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    try:
+        yield port, _SmokeTestHealthHandler
+    finally:
+        server.shutdown()
+        server_thread.join(timeout=5)
 
 
 def _run_cli(args, cwd, path_dirs=None):
@@ -966,4 +1062,206 @@ def test_deploy_dry_run_json_flag_reports_pushed_true_when_push_requested(tmp_pa
         "pushed": True,
         "dry_run": True,
     }
+    assert not log_path.exists()
+
+
+def test_deploy_smoke_test_flag_documented_in_help(tmp_path):
+
+    proc = _run_cli(["deploy", "--help"], cwd=tmp_path)
+
+    assert proc.returncode == 0
+    assert "--smoke-test" in proc.stdout
+
+
+def test_deploy_smoke_test_passes_when_health_responds_200(
+    tmp_path, fake_container_health_server, monkeypatch
+):
+
+    port, _handler = fake_container_health_server
+    monkeypatch.setenv("FAKE_DOCKER_PORT_STDOUT", f"127.0.0.1:{port}")
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook(notebook_path)
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+
+    proc = _run_cli(
+        ["deploy", str(notebook_path), "--output", "built_api", "--smoke-test"],
+        cwd=workdir,
+        path_dirs=[str(bin_dir)],
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Smoke test: passed" in proc.stdout
+
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    subcommands = [call.splitlines()[0] for call in calls]
+    assert "run" in subcommands
+    assert "stop" in subcommands
+
+
+def test_deploy_smoke_test_json_flag_includes_smoke_test_field(
+    tmp_path, fake_container_health_server, monkeypatch
+):
+
+    port, _handler = fake_container_health_server
+    monkeypatch.setenv("FAKE_DOCKER_PORT_STDOUT", f"127.0.0.1:{port}")
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook(notebook_path)
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+
+    proc = _run_cli(
+        [
+            "deploy", str(notebook_path), "--output", "built_api",
+            "--smoke-test", "--json",
+        ],
+        cwd=workdir,
+        path_dirs=[str(bin_dir)],
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    data = json.loads(proc.stdout)
+    assert data["smoke_test"] == {"passed": True, "status_code": 200, "detail": None}
+
+
+def test_deploy_smoke_test_exits_1_when_docker_run_fails(tmp_path, monkeypatch):
+
+    monkeypatch.setenv("FAKE_DOCKER_RUN_EXIT_CODE", "1")
+    monkeypatch.setenv("FAKE_DOCKER_RUN_STDERR", "no such image")
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook(notebook_path)
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+
+    proc = _run_cli(
+        ["deploy", str(notebook_path), "--output", "built_api", "--smoke-test"],
+        cwd=workdir,
+        path_dirs=[str(bin_dir)],
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Smoke test: FAILED" in proc.stdout
+    assert "no such image" in proc.stdout
+
+
+def test_deploy_smoke_test_json_flag_exits_1_on_failure(tmp_path, monkeypatch):
+
+    monkeypatch.setenv("FAKE_DOCKER_RUN_EXIT_CODE", "1")
+    monkeypatch.setenv("FAKE_DOCKER_RUN_STDERR", "no such image")
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook(notebook_path)
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+
+    proc = _run_cli(
+        [
+            "deploy", str(notebook_path), "--output", "built_api",
+            "--smoke-test", "--json",
+        ],
+        cwd=workdir,
+        path_dirs=[str(bin_dir)],
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["smoke_test"]["passed"] is False
+
+
+def test_deploy_smoke_test_never_blocks_a_requested_push(tmp_path, monkeypatch):
+
+    monkeypatch.setenv("FAKE_DOCKER_RUN_EXIT_CODE", "1")
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook(notebook_path)
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+
+    proc = _run_cli(
+        [
+            "deploy", str(notebook_path), "--output", "built_api",
+            "--smoke-test", "--push",
+        ],
+        cwd=workdir,
+        path_dirs=[str(bin_dir)],
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "pushed successfully" in proc.stdout
+
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    subcommands = [call.splitlines()[0] for call in calls]
+    assert "push" in subcommands
+
+
+def test_deploy_smoke_test_omitted_by_default(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook(notebook_path)
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+
+    proc = _run_cli(
+        ["deploy", str(notebook_path), "--output", "built_api"],
+        cwd=workdir,
+        path_dirs=[str(bin_dir)],
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Smoke test" not in proc.stdout
+
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    subcommands = [call.splitlines()[0] for call in calls]
+    assert "run" not in subcommands
+
+
+def test_deploy_smoke_test_ignored_under_dry_run(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook(notebook_path)
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+
+    proc = _run_cli(
+        [
+            "deploy", str(notebook_path), "--output", "built_api",
+            "--smoke-test", "--dry-run",
+        ],
+        cwd=workdir,
+        path_dirs=[str(bin_dir)],
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not log_path.exists()

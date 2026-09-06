@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -20566,6 +20567,321 @@ def test_deploy_endpoint_dry_run_does_not_record_a_history_entry(tmp_path, monke
         entry["tag"] != "deploy-dry-run-history:latest"
         for entry in history_resp.json()["entries"]
     )
+
+
+def _install_fake_docker_with_smoke_test_support(bin_dir, log_path):
+    """A fake `docker` executable supporting `run`/`port`/`stop`/`logs`
+    (for POST /api/deploy's own "smoke_test") on top of the same
+    invocation-logging `_install_fake_docker` above already provides for
+    `build`/`push` -- each subcommand's own behavior is driven by
+    environment variables a test sets via monkeypatch.setenv, read at
+    invocation time by this same script (inherited by the real `docker
+    run`/`docker port`/... subprocess.run calls _run_deploy_smoke_test
+    makes), so one stub can stand in for a healthy, unhealthy, or
+    outright failing container across different tests without rewriting
+    the script itself:
+
+      FAKE_DOCKER_RUN_EXIT_CODE (default 0), FAKE_DOCKER_RUN_STDOUT
+      (default "fake-container-id"), FAKE_DOCKER_RUN_STDERR (default "")
+      FAKE_DOCKER_PORT_EXIT_CODE (default 0), FAKE_DOCKER_PORT_STDOUT
+      (default "") -- a real test points this at a real local HTTP
+      server's own "127.0.0.1:<port>" (see fake_container_health_server
+      below) so _run_deploy_smoke_test's own GET /health polling has
+      something real to actually reach.
+      FAKE_DOCKER_LOGS_STDOUT (default "") -- returned by `docker logs`,
+      surfaced in a failed smoke test's own "detail".
+    """
+
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text(
+        "#!/bin/sh\n"
+        f'{{ printf \'%s\\n\' "$@"; pwd; printf \'%s\\n\' "==CALL=="; }} >> "{log_path}"\n'
+        'case "$1" in\n'
+        "  run)\n"
+        '    printf \'%s\' "${FAKE_DOCKER_RUN_STDOUT:-fake-container-id}"\n'
+        '    printf \'%s\' "${FAKE_DOCKER_RUN_STDERR:-}" >&2\n'
+        '    exit "${FAKE_DOCKER_RUN_EXIT_CODE:-0}"\n'
+        "    ;;\n"
+        "  port)\n"
+        '    printf \'%s\' "${FAKE_DOCKER_PORT_STDOUT:-}"\n'
+        '    exit "${FAKE_DOCKER_PORT_EXIT_CODE:-0}"\n'
+        "    ;;\n"
+        "  stop)\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  logs)\n"
+        '    printf \'%s\' "${FAKE_DOCKER_LOGS_STDOUT:-}"\n'
+        "    exit 0\n"
+        "    ;;\n"
+        "  *)\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(docker_stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+class _SmokeTestHealthHandler(http.server.BaseHTTPRequestHandler):
+    """Stands in for the compiled app's own GET /health inside the
+    "container" _run_deploy_smoke_test's own `docker run` would otherwise
+    have started for real -- fake_container_health_server below points
+    the fake docker's own "docker port" output at this real local server
+    instead, so the smoke test's actual polling/timeout/retry logic runs
+    against a genuine HTTP server, not a mock of one.
+    """
+
+    status_code = 200
+
+    def do_GET(self):
+
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        self.send_response(type(self).status_code)
+        body = b'{"status": "healthy"}'
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def fake_container_health_server():
+    _SmokeTestHealthHandler.status_code = 200
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _SmokeTestHealthHandler)
+    port = server.server_address[1]
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    try:
+        yield port, _SmokeTestHealthHandler
+    finally:
+        server.shutdown()
+        server_thread.join(timeout=5)
+
+
+@pytest.fixture
+def _fast_deploy_smoke_test_timing(monkeypatch):
+    """Every failure-path smoke-test test below needs the real
+    poll-until-timeout loop to actually run to completion -- without
+    this, each one would otherwise take DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS's
+    own real 30s default.
+    """
+    from backend.routes import upload as upload_module
+
+    monkeypatch.setattr(upload_module, "DEPLOY_SMOKE_TEST_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(
+        upload_module, "_DEPLOY_SMOKE_TEST_POLL_INTERVAL_SECONDS", 0.05
+    )
+
+
+def test_deploy_endpoint_omits_smoke_test_by_default(tmp_path, monkeypatch):
+
+    _compile_a_notebook("deploy_no_smoke_test.ipynb")
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker(bin_dir, log_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    resp = client.post("/api/deploy", json={})
+
+    assert resp.status_code == 200
+    assert "smoke_test" not in resp.json()
+
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    assert all(call.splitlines()[0] != "run" for call in calls)
+
+
+def test_deploy_endpoint_smoke_test_passes_when_health_responds_200(
+    tmp_path, monkeypatch, fake_container_health_server
+):
+
+    port, _handler = fake_container_health_server
+
+    _compile_a_notebook("deploy_smoke_test_pass.ipynb")
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_PORT_STDOUT", f"127.0.0.1:{port}")
+
+    resp = client.post("/api/deploy", json={"smoke_test": True})
+
+    assert resp.status_code == 200
+    smoke_test = resp.json()["smoke_test"]
+    assert smoke_test == {"passed": True, "status_code": 200, "detail": None}
+
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    subcommands = [call.splitlines()[0] for call in calls]
+    assert "run" in subcommands
+    assert "stop" in subcommands
+
+
+def test_deploy_endpoint_smoke_test_fails_when_docker_run_fails(tmp_path, monkeypatch):
+
+    _compile_a_notebook("deploy_smoke_test_run_fails.ipynb")
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_RUN_EXIT_CODE", "1")
+    monkeypatch.setenv("FAKE_DOCKER_RUN_STDERR", "no such image")
+
+    resp = client.post("/api/deploy", json={"smoke_test": True})
+
+    assert resp.status_code == 200
+    smoke_test = resp.json()["smoke_test"]
+    assert smoke_test["passed"] is False
+    assert smoke_test["status_code"] is None
+    assert "no such image" in smoke_test["detail"]
+
+    # docker run failed before ever producing a container id -- there is
+    # nothing to stop.
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    subcommands = [call.splitlines()[0] for call in calls]
+    assert "stop" not in subcommands
+
+
+def test_deploy_endpoint_smoke_test_fails_when_docker_port_fails(
+    tmp_path, monkeypatch
+):
+
+    _compile_a_notebook("deploy_smoke_test_port_fails.ipynb")
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_PORT_EXIT_CODE", "1")
+
+    resp = client.post("/api/deploy", json={"smoke_test": True})
+
+    assert resp.status_code == 200
+    smoke_test = resp.json()["smoke_test"]
+    assert smoke_test["passed"] is False
+    assert "Could not determine the container's own port" in smoke_test["detail"]
+
+    # The container was still successfully started -- it must still be
+    # stopped even though the smoke test itself failed.
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    subcommands = [call.splitlines()[0] for call in calls]
+    assert "stop" in subcommands
+
+
+def test_deploy_endpoint_smoke_test_times_out_and_reports_container_logs(
+    tmp_path, monkeypatch, _fast_deploy_smoke_test_timing
+):
+    """Points "docker port" at a closed local port -- nothing is
+    listening there, so every poll attempt fails to even connect -- and
+    confirms the failure detail actually surfaces the container's own
+    logs, not just a bare timeout message with no way to diagnose why.
+    """
+
+    _compile_a_notebook("deploy_smoke_test_timeout.ipynb")
+
+    closed_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    closed_socket.bind(("127.0.0.1", 0))
+    closed_port = closed_socket.getsockname()[1]
+    closed_socket.close()
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_PORT_STDOUT", f"127.0.0.1:{closed_port}")
+    monkeypatch.setenv("FAKE_DOCKER_LOGS_STDOUT", "Traceback: ImportError: no module named foo")
+
+    resp = client.post("/api/deploy", json={"smoke_test": True})
+
+    assert resp.status_code == 200
+    smoke_test = resp.json()["smoke_test"]
+    assert smoke_test["passed"] is False
+    assert smoke_test["status_code"] is None
+    assert "ImportError: no module named foo" in smoke_test["detail"]
+
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    subcommands = [call.splitlines()[0] for call in calls]
+    assert "stop" in subcommands
+
+
+def test_deploy_endpoint_smoke_test_fails_when_health_never_returns_200(
+    tmp_path, monkeypatch, fake_container_health_server, _fast_deploy_smoke_test_timing
+):
+
+    port, handler = fake_container_health_server
+    handler.status_code = 503
+
+    _compile_a_notebook("deploy_smoke_test_unhealthy.ipynb")
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_PORT_STDOUT", f"127.0.0.1:{port}")
+
+    resp = client.post("/api/deploy", json={"smoke_test": True})
+
+    assert resp.status_code == 200
+    smoke_test = resp.json()["smoke_test"]
+    assert smoke_test["passed"] is False
+    assert smoke_test["status_code"] == 503
+    assert "last responded 503" in smoke_test["detail"]
+
+
+def test_deploy_endpoint_smoke_test_never_blocks_a_requested_push(
+    tmp_path, monkeypatch
+):
+    """A failed smoke test is purely diagnostic -- it must never prevent
+    an already-requested push from actually happening, the same
+    "diagnostic, not gating" relationship POST /api/compile's own
+    "smoke_test" already has with a successful compile.
+    """
+
+    _compile_a_notebook("deploy_smoke_test_does_not_block_push.ipynb")
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_RUN_EXIT_CODE", "1")
+
+    resp = client.post("/api/deploy", json={"smoke_test": True, "push": True})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["smoke_test"]["passed"] is False
+    assert body["pushed"] is True
+
+    calls = [block for block in log_path.read_text(encoding="utf-8").split("==CALL==\n") if block]
+    subcommands = [call.splitlines()[0] for call in calls]
+    assert "push" in subcommands
+
+
+def test_deploy_endpoint_dry_run_skips_smoke_test_entirely(tmp_path, monkeypatch):
+
+    _compile_a_notebook("deploy_smoke_test_dry_run.ipynb")
+
+    bin_dir = tmp_path / "fakebin"
+    log_path = tmp_path / "docker_invocation.log"
+    _install_fake_docker_with_smoke_test_support(bin_dir, log_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    resp = client.post("/api/deploy", json={"smoke_test": True, "dry_run": True})
+
+    assert resp.status_code == 200
+    assert "smoke_test" not in resp.json()
+    assert not log_path.exists()
 
 
 def test_deploy_history_is_empty_before_any_deploy(monkeypatch, tmp_path):

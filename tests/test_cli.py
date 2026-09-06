@@ -17004,6 +17004,103 @@ def test_remote_deploy_command_omits_no_cache_by_default(tmp_path, fake_dashboar
     assert "no_cache" not in json.loads(handler.bodies[0])
 
 
+def test_remote_deploy_command_passes_smoke_test_through(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success", "tag": "generated:latest", "pushed": False,
+            "smoke_test": {"passed": True, "status_code": 200, "detail": None},
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["remote-deploy", "--dashboard-url", dashboard_url, "--smoke-test"],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(handler.bodies[0]) == {
+        "push": False, "force": False, "smoke_test": True,
+    }
+    assert "Smoke test: passed" in proc.stdout
+
+
+def test_remote_deploy_command_omits_smoke_test_by_default(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {"status": "success", "tag": "generated:latest", "pushed": False})
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["remote-deploy", "--dashboard-url", dashboard_url],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "smoke_test" not in json.loads(handler.bodies[0])
+    assert "Smoke test" not in proc.stdout
+
+
+def test_remote_deploy_command_exits_1_when_the_smoke_test_fails(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success", "tag": "generated:latest", "pushed": False,
+            "smoke_test": {
+                "passed": False, "status_code": None,
+                "detail": "Docker run failed: no such image",
+            },
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["remote-deploy", "--dashboard-url", dashboard_url, "--smoke-test"],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Smoke test: FAILED" in proc.stdout
+    assert "no such image" in proc.stdout
+
+
+def test_remote_deploy_command_json_flag_exits_1_when_the_smoke_test_fails(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    body = {
+        "status": "success", "tag": "generated:latest", "pushed": False,
+        "smoke_test": {"passed": False, "status_code": None, "detail": "boom"},
+    }
+    handler.responses = [_json_response(200, body)]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "remote-deploy", "--dashboard-url", dashboard_url,
+            "--smoke-test", "--json",
+        ],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout) == body
+
+
 def test_remote_deploy_command_dry_run_passes_the_flag_through_and_prints_would_build(
     tmp_path, fake_dashboard
 ):
