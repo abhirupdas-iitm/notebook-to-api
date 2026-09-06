@@ -78,6 +78,10 @@ from backend.generator.docker_generator import (
     generate_readme
 )
 
+from backend.generator.kubernetes_generator import (
+    generate_kubernetes_manifest,
+)
+
 
 @functools.lru_cache(maxsize=1)
 def _installed_packages_distributions():
@@ -856,7 +860,7 @@ def hash_notebook_file(notebook_path):
 # Every file a real compile actually writes into output_dir, relative to
 # it -- "app.py" itself is appended separately in
 # _generated_files_sha256 below, since its own filename is a caller-
-# supplied output_path, not a fixed literal the way these seven are.
+# supplied output_path, not a fixed literal the way these eight are.
 # Deliberately a fixed list, not a generic directory walk: an operator's
 # own unrelated file dropped into output_dir by hand (or a later POST
 # /api/export-openapi/export-sdk's own openapi.json/sdk/, which a
@@ -868,6 +872,7 @@ _GENERATED_OUTPUT_RELATIVE_PATHS = (
     "Dockerfile",
     ".dockerignore",
     "docker-compose.yml",
+    "kubernetes.yaml",
     ".env.example",
     "README.md",
     os.path.join("runtime", "notebook_module.py"),
@@ -1361,6 +1366,15 @@ def compile_notebook_to_api(
             )
 
             generate_env_example(env_example_path, GENERATED_APP_ENV_VARS)
+
+            kubernetes_manifest_path = os.path.join(
+                output_dir,
+                "kubernetes.yaml"
+            )
+
+            generate_kubernetes_manifest(
+                kubernetes_manifest_path, package_name, GENERATED_APP_ENV_VARS
+            )
 
             readme_path = os.path.join(
                 output_dir,

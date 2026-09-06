@@ -40,6 +40,10 @@ from backend.generator.docker_generator import (
     generate_docker_compose,
     generate_env_example,
 )
+from backend.generator.kubernetes_generator import (
+    generate_kubernetes_manifest,
+    kubernetes_manifest_content,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -749,6 +753,156 @@ def test_compiler_pipeline_generates_an_env_example_file(tmp_path):
     assert "NOTEBOOK_API_RATE_LIMIT_PER_MINUTE=0" in env_example
 
 
+def test_generate_dockerignore_excludes_kubernetes_manifest(tmp_path):
+    """kubernetes.yaml (generate_kubernetes_manifest, backend/generator/
+    kubernetes_generator.py) is now written into the same output directory
+    as the compiled app on every compile too -- a purely deploy-tooling
+    convenience file the running app never reads at runtime, the identical
+    "never read by the app, so it shouldn't ship in the image" reasoning
+    this .dockerignore already applies to docker-compose.yml/.env.example.
+    """
+
+    output_path = tmp_path / ".dockerignore"
+
+    generate_dockerignore(str(output_path))
+
+    dockerignore = output_path.read_text(encoding="utf-8")
+    assert "kubernetes.yaml" in dockerignore
+
+
+def test_kubernetes_manifest_content_matches_generate_kubernetes_manifests_own_output(
+    tmp_path
+):
+    """kubernetes_manifest_content is the pure string
+    generate_kubernetes_manifest itself writes to disk -- see
+    dockerfile_content's own docstring for why this split exists. Confirms
+    the two can't drift apart, the same "preview matches the real write"
+    guarantee already covered for dockerfile_content/generate_dockerfile
+    above.
+    """
+
+    env_vars = [
+        {"name": "NOTEBOOK_API_KEY", "default": "dev-key", "description": "..."},
+    ]
+
+    output_path = tmp_path / "kubernetes.yaml"
+
+    generate_kubernetes_manifest(str(output_path), "myapp", env_vars)
+
+    assert (
+        output_path.read_text(encoding="utf-8")
+        == kubernetes_manifest_content("myapp", env_vars)
+    )
+
+
+def test_kubernetes_manifest_content_uses_the_given_package_name_throughout():
+
+    content = kubernetes_manifest_content("myapp", [])
+
+    assert "  name: myapp\n" in content
+    assert "    app: myapp\n" in content
+    assert "image: myapp:latest\n" in content
+
+
+def test_kubernetes_manifest_content_renders_both_a_deployment_and_a_service():
+
+    content = kubernetes_manifest_content("generated", [])
+
+    documents = content.split("\n---\n")
+    assert len(documents) == 2
+    assert "kind: Deployment" in documents[0]
+    assert "kind: Service" in documents[1]
+
+
+def test_kubernetes_manifest_content_wires_up_health_and_readiness_probes():
+    """GET /health and GET /ready are the compiled app's own two built-in
+    routes with no Depends(verify_api_key) (see RESERVED_INFRASTRUCTURE_NAMES,
+    backend/generator/api_generator.py) -- the same unauthenticated routes
+    the Dockerfile's own HEALTHCHECK already curls, so a probe here needs
+    no credential this manifest would otherwise have to embed.
+    """
+
+    content = kubernetes_manifest_content("generated", [])
+
+    assert "livenessProbe:" in content
+    assert "readinessProbe:" in content
+    assert content.count("path: /health") == 1
+    assert content.count("path: /ready") == 1
+
+
+def test_kubernetes_manifest_content_maps_container_port_to_the_port_env_var():
+
+    content = kubernetes_manifest_content("generated", [])
+
+    assert "containerPort: 8000" in content
+    assert '- name: PORT\n              value: "8000"' in content
+
+
+def test_kubernetes_manifest_content_lists_every_env_var_with_its_own_default():
+
+    env_vars = [
+        {"name": "NOTEBOOK_API_KEY", "default": "dev-key", "description": "..."},
+        {"name": "NOTEBOOK_API_MAX_TASKS", "default": "10000", "description": "..."},
+    ]
+
+    content = kubernetes_manifest_content("generated", env_vars)
+
+    assert '- name: NOTEBOOK_API_KEY\n              value: "dev-key"' in content
+    assert (
+        '- name: NOTEBOOK_API_MAX_TASKS\n              value: "10000"' in content
+    )
+
+
+def test_kubernetes_manifest_content_with_no_env_vars_still_maps_port():
+    """An empty env_vars list (or None) must still produce a valid,
+    usable manifest -- just with nothing beyond PORT in its own "env:"
+    list -- rather than a malformed file missing the "env:" key's own
+    required list entirely.
+    """
+
+    content = kubernetes_manifest_content("generated", [])
+
+    assert '- name: PORT\n              value: "8000"' in content
+
+    content_none = kubernetes_manifest_content("generated", None)
+
+    assert content_none == content
+
+
+def test_compiler_pipeline_generates_a_kubernetes_manifest_file(tmp_path):
+    """Confirmed missing before this feature: a compiled app already got a
+    Dockerfile, a docker-compose.yml for a single-host `docker compose up`,
+    and a .env.example -- but nothing for a Kubernetes cluster, the
+    deployment target GET /api/env-vars-preview's own docstring already
+    names alongside docker-compose.yml/.env.example in passing. POST
+    /api/compile (and the CLI's own `compile`) now also writes a
+    ready-to-`kubectl apply` kubernetes.yaml alongside them, on every
+    compile.
+    """
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.cells.append(
+        nbformat.v4.new_code_cell(
+            "def add(a: int, b: int) -> int:\n    return a + b\n"
+        )
+    )
+
+    notebook_path = tmp_path / "nb.ipynb"
+    with open(notebook_path, "w", encoding="utf-8") as f:
+        nbformat.write(notebook, f)
+
+    output_dir = tmp_path / "generated"
+    compile_notebook(str(notebook_path), str(output_dir))
+
+    manifest_path = output_dir / "kubernetes.yaml"
+    assert manifest_path.is_file()
+
+    manifest = manifest_path.read_text(encoding="utf-8")
+    assert "  name: generated\n" in manifest
+    assert 'value: "notebook-to-api-dev-key"' in manifest
+    assert "NOTEBOOK_API_KEY" in manifest
+
+
 def test_compiler_pipeline_generates_a_readme_file(tmp_path):
     """Confirmed missing before this feature: a compiled app shipped
     app.py, requirements.txt, a Dockerfile/.dockerignore/docker-
@@ -1305,6 +1459,12 @@ generate_python_sdk(
     # reads, so it must be ignored the same way.
     assert (output_dir / "docker-compose.yml").is_file()
     assert is_ignored("docker-compose.yml")
+    # kubernetes.yaml (generate_kubernetes_manifest) is the same kind of
+    # deploy-tooling convenience file docker-compose.yml already is, just
+    # for a Kubernetes cluster instead of a single host -- it must be
+    # ignored for the identical reason.
+    assert (output_dir / "kubernetes.yaml").is_file()
+    assert is_ignored("kubernetes.yaml")
     # The actually-deployable artifacts must NOT be swept up by the same
     # patterns.
     assert not is_ignored("app.py")
@@ -4390,6 +4550,42 @@ def test_generated_files_sha256_changes_when_env_example_is_hand_edited(tmp_path
 
     (output_dir / ".env.example").write_text(
         "PORT=9999\n", encoding="utf-8"
+    )
+
+    assert _generated_files_sha256(str(output_dir)) != baseline
+
+
+def test_generated_files_sha256_changes_when_kubernetes_manifest_is_hand_edited(
+    tmp_path
+):
+    """kubernetes.yaml (generate_kubernetes_manifest) is now a real
+    compile-produced artifact, like docker-compose.yml/.env.example/
+    README.md -- it must participate in the same hand-edit detection
+    _generated_files_sha256 already gives those, or GET /api/notebooks'
+    own "generated_files_modified_since_compile" would silently miss a
+    hand-edit to it.
+    """
+
+    from backend.compiler import _generated_files_sha256
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.cells.append(
+        nbformat.v4.new_code_cell(
+            "def add(a: int, b: int) -> int:\n    return a + b\n"
+        )
+    )
+
+    notebook_path = tmp_path / "nb.ipynb"
+    with open(notebook_path, "w", encoding="utf-8") as f:
+        nbformat.write(notebook, f)
+
+    output_dir = tmp_path / "generated"
+    compile_notebook(str(notebook_path), str(output_dir))
+
+    baseline = _generated_files_sha256(str(output_dir))
+
+    (output_dir / "kubernetes.yaml").write_text(
+        "kind: Deployment\n", encoding="utf-8"
     )
 
     assert _generated_files_sha256(str(output_dir)) != baseline

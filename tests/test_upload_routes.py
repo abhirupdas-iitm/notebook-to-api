@@ -19219,6 +19219,65 @@ def test_docker_compose_preview_does_not_touch_generated_dir(monkeypatch, tmp_pa
     assert not generated_dir.exists()
 
 
+def test_k8s_preview_requires_no_notebook_and_needs_no_body():
+
+    resp = client.get("/api/k8s-preview")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    assert "kind: Deployment" in body["kubernetes_manifest"]
+    assert "kind: Service" in body["kubernetes_manifest"]
+    assert 'value: "notebook-to-api-dev-key"' in body["kubernetes_manifest"]
+
+
+def test_k8s_preview_matches_what_an_actual_compile_writes():
+
+    filename = "k8s_preview_match.ipynb"
+    _upload_sample_notebook(filename)
+
+    preview_resp = client.get("/api/k8s-preview")
+    assert preview_resp.status_code == 200
+    preview_body = preview_resp.json()
+
+    compile_resp = client.post(
+        "/api/compile", json={"notebook_path": filename}
+    )
+    assert compile_resp.status_code == 200
+
+    actual_manifest = client.get(
+        "/api/generated/kubernetes.yaml"
+    ).json()["content"]
+
+    assert preview_body["kubernetes_manifest"] == actual_manifest
+    assert preview_body["package_name"] == package_name_for_output_dir(GENERATED_DIR)
+
+
+def test_k8s_preview_reflects_a_configured_package_name(monkeypatch, tmp_path):
+
+    generated_dir = tmp_path / "my_custom_pkg"
+    monkeypatch.setattr("backend.routes.upload.GENERATED_DIR", str(generated_dir))
+
+    resp = client.get("/api/k8s-preview")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["package_name"] == "my_custom_pkg"
+    assert "  name: my_custom_pkg\n" in body["kubernetes_manifest"]
+    assert "image: my_custom_pkg:latest\n" in body["kubernetes_manifest"]
+
+
+def test_k8s_preview_does_not_touch_generated_dir(monkeypatch, tmp_path):
+
+    generated_dir = tmp_path / "k8s_preview_no_side_effects"
+    monkeypatch.setattr("backend.routes.upload.GENERATED_DIR", str(generated_dir))
+
+    resp = client.get("/api/k8s-preview")
+
+    assert resp.status_code == 200
+    assert not generated_dir.exists()
+
+
 def test_env_example_preview_requires_no_notebook_and_needs_no_body():
 
     resp = client.get("/api/env-example-preview")

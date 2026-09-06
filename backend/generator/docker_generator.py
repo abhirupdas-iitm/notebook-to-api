@@ -446,6 +446,7 @@ env/
 Dockerfile
 .dockerignore
 docker-compose.yml
+kubernetes.yaml
 .env.example
 README.md
 openapi.json
@@ -474,11 +475,13 @@ def generate_dockerignore(output_path="generated/.dockerignore"):
     the exact kind of build-context noise this .dockerignore already
     exists to keep out.
 
-    .env.example (see env_example_content above) is excluded for the same
-    reason Dockerfile/.dockerignore/docker-compose.yml already are: it
-    exists purely to hand an operator a template to copy to their own
-    `.env` before *building or running* this image, never read by the
-    running app itself.
+    .env.example (see env_example_content above) and kubernetes.yaml (see
+    kubernetes_manifest_content, backend/generator/kubernetes_generator.py)
+    are excluded for the same reason Dockerfile/.dockerignore/
+    docker-compose.yml already are: each exists purely to hand an operator
+    a ready-to-use deployment artifact -- a template to copy to their own
+    `.env`, or a manifest to `kubectl apply` -- never read by the running
+    app itself.
 
     README.md (see readme_content above) is excluded for the identical
     reason: purely documentation for a human looking at the compiled

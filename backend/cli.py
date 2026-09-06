@@ -355,7 +355,7 @@ _CORE_COMMANDS = frozenset({
     "versions", "remote-files", "remote-diff", "diff-notebooks", "remote-export", "remote-deploy",
     "status", "remote-validate", "validate-all", "requirements-preview", "curl-preview",
     "remote-curl", "app-preview", "dockerfile-preview", "docker-compose-preview", "env-example-preview", "env-vars-preview",
-    "postman-preview",
+    "postman-preview", "k8s-preview",
 })
 
 # Exception types raised by real, expected failure conditions in the core
@@ -4234,6 +4234,38 @@ def _dispatch_core_command(args):
                 f"(package '{data.get('package_name')}'):\n"
             )
             print(data.get("docker_compose", ""))
+    elif args.command == "k8s-preview":
+        # See `upload` above for why this is imported here rather than at
+        # module scope.
+        import httpx
+
+        dashboard_url = args.dashboard_url.rstrip("/")
+
+        try:
+            response = httpx.get(
+                f"{dashboard_url}/api/k8s-preview",
+                timeout=args.timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise _dashboard_connection_error(exc, dashboard_url)
+
+        if response.status_code >= 400:
+
+            raise RuntimeError(
+                f"Dashboard rejected the request ({response.status_code}): "
+                f"{_extract_dashboard_error_detail(response)}"
+            )
+
+        data = response.json()
+
+        if args.json_output:
+            print(json.dumps(data, indent=2))
+        else:
+            print(
+                f"kubernetes.yaml preview for {dashboard_url} "
+                f"(package '{data.get('package_name')}'):\n"
+            )
+            print(data.get("kubernetes_manifest", ""))
     elif args.command == "env-example-preview":
         # See `upload` above for why this is imported here rather than at
         # module scope.
@@ -9043,6 +9075,30 @@ def main():
         help=(
             "Emit the dashboard's own JSON response ({\"status\", "
             "\"package_name\", \"docker_compose\"}) instead of a "
+            "human-readable preview, for scripting/automation."
+        )
+    )
+
+    # k8s-preview command (preview the kubernetes.yaml a compile on a
+    # running dashboard would produce, via its own GET /api/k8s-preview --
+    # takes no notebook argument, the same reason docker-compose-preview
+    # above doesn't: neither varies by notebook)
+    k8s_preview_parser = subparsers.add_parser(
+        "k8s-preview",
+        help=(
+            "Preview the exact kubernetes.yaml a compile on a running "
+            "dashboard would produce, via its GET /api/k8s-preview -- "
+            "without compiling anything."
+        )
+    )
+    _add_dashboard_url_and_timeout_arguments(k8s_preview_parser)
+    k8s_preview_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help=(
+            "Emit the dashboard's own JSON response ({\"status\", "
+            "\"package_name\", \"kubernetes_manifest\"}) instead of a "
             "human-readable preview, for scripting/automation."
         )
     )

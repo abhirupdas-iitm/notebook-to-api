@@ -61,6 +61,9 @@ from backend.generator.docker_generator import (
     docker_compose_content,
     env_example_content,
 )
+from backend.generator.kubernetes_generator import (
+    kubernetes_manifest_content,
+)
 from backend.inspector import (
     EXCLUDED_GENERATED_DIR_NAMES,
     EXCLUDED_GENERATED_FILE_NAMES,
@@ -2351,7 +2354,8 @@ def _currently_compiled_notebook_metadata():
 def _generated_files_modified_since_compile():
     """Whether GENERATED_DIR's own compile-produced files (app.py,
     requirements.txt, Dockerfile, .dockerignore, docker-compose.yml,
-    .env.example, README.md, the runtime module) no longer match the baseline
+    kubernetes.yaml, .env.example, README.md, the runtime module) no
+    longer match the baseline
     write_compile_metadata
     recorded for them at compile time (see "generated_files_sha256",
     backend/compiler.py) -- the output-side mirror of
@@ -10956,6 +10960,42 @@ def env_example_preview_endpoint():
     }
 
 
+@router.get("/k8s-preview")
+def k8s_preview_endpoint():
+    """The exact kubernetes.yaml text POST /api/compile now also writes
+    into GENERATED_DIR on every compile (alongside the Dockerfile/
+    .dockerignore/docker-compose.yml/.env.example) -- without actually
+    compiling anything, or touching GENERATED_DIR at all.
+
+    Like GET /api/docker-compose-preview above (whose own docker-
+    compose.yml similarly never varies by notebook), takes no
+    notebook_path: kubernetes_manifest_content only ever depends on this
+    dashboard's own fixed "package_name" (the same
+    package_name_for_output_dir(GENERATED_DIR) GET /api/dockerfile-preview/
+    GET /api/docker-compose-preview already reuse) and
+    GENERATED_APP_ENV_VARS (backend/generator/api_generator.py) -- never on
+    which notebook is being compiled.
+
+    Reuses kubernetes_manifest_content directly -- the same pure string-
+    building helper generate_kubernetes_manifest itself now calls before
+    ever touching disk -- so "kubernetes_manifest" below can never drift
+    from what an actual compile writes to GENERATED_DIR/kubernetes.yaml,
+    the same "can't drift from the real thing" guarantee GET
+    /api/docker-compose-preview/GET /api/env-vars-preview already provide
+    for their own artifacts.
+    """
+
+    package_name = package_name_for_output_dir(GENERATED_DIR)
+
+    return {
+        "status": "success",
+        "package_name": package_name,
+        "kubernetes_manifest": kubernetes_manifest_content(
+            package_name, GENERATED_APP_ENV_VARS
+        ),
+    }
+
+
 @router.get("/env-vars-preview")
 def env_vars_preview_endpoint():
     """Every environment variable a compiled app itself recognizes to
@@ -13075,8 +13115,8 @@ def list_generated_files_endpoint(checksums: bool = False):
     reports for the currently-compiled entry: that one catches the
     *source notebook* having changed since the last compile, this one
     catches the compiled *output itself* -- app.py, requirements.txt,
-    Dockerfile, .dockerignore, docker-compose.yml, .env.example,
-    README.md, the runtime module -- having been hand-edited on the server since then,
+    Dockerfile, .dockerignore, docker-compose.yml, kubernetes.yaml,
+    .env.example, README.md, the runtime module -- having been hand-edited on the server since then,
     which nothing before this could detect at all. True/False once a
     compile with this field has actually happened; null if nothing has
     been compiled yet, or if GENERATED_DIR was produced by a compile that
