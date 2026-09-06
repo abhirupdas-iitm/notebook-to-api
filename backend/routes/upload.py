@@ -164,6 +164,15 @@ router = APIRouter(
 # not this one-time directory creation.
 UPLOAD_DIR = os.getenv("NOTEBOOK_API_UPLOAD_DIR", "uploads")
 
+# Read once, at import time -- the same "this dashboard process' own
+# moment of birth" this module is first imported (i.e. process startup,
+# not whenever a request happens to arrive) that every *generated* app's
+# own START_TIME (backend/generator/api_generator.py) already captures
+# identically, for the identical reason: GET /api/metrics/prometheus
+# below reports how long *this* process has been running, not how long
+# any individual request took.
+_DASHBOARD_START_TIME = time.time()
+
 # Confirmed catastrophic if left unchecked: NOTEBOOK_API_UPLOAD_DIR and
 # NOTEBOOK_API_GENERATED_DIR are each read independently above, with
 # nothing stopping an operator from -- accidentally or otherwise --
@@ -13884,6 +13893,104 @@ def health_check(check_writable: bool = False):
         response["generated_dir_writable"] = _directory_is_writable(GENERATED_DIR)
 
     return response
+
+
+@router.get("/metrics/prometheus")
+def dashboard_metrics_prometheus():
+    """This dashboard's own operational metrics -- how many notebooks it
+    holds, whether it currently has a compiled app, how many deploys/
+    compiles it's recorded, and how long it's been running -- rendered as
+    real Prometheus text exposition format, so a real Prometheus (or
+    anything else speaking its own scrape format -- Grafana Agent,
+    VictoriaMetrics, ...) can monitor this dashboard process the same way
+    every *generated* app's own identically-named GET /metrics/prometheus
+    already lets it monitor a compiled app's own background-task
+    throughput.
+
+    Before this, none of this dashboard's own operational state was
+    exposed as a time series at all: GET /api/health already answers "is
+    a compiled app present right now" as a single point-in-time snapshot,
+    and GET /api/notebooks/GET /api/deploy/history/GET /api/compile/history
+    each already carry this exact same information buried inside a much
+    larger response an operator would have to fetch and parse just to
+    extract one number from -- there was no single, cheap, scrape-shaped
+    endpoint a monitoring stack could poll on a timer to graph "notebooks
+    over time" or "deploys per day" without hitting this dashboard's own
+    full notebook catalog or history log on every scrape interval.
+
+    "notebook_to_api_dashboard_notebooks_total" is the same ".ipynb file
+    directly inside UPLOAD_DIR" count GET /api/notebooks' own
+    "total_count" (with no filters applied) already reports, just without
+    needing to actually build that endpoint's own full per-notebook
+    "notebooks" list first.
+
+    "notebook_to_api_dashboard_compiled_app_present" mirrors GET
+    /api/health's own identically-named field -- 1/0 rather than
+    true/false, the numeric encoding Prometheus' own gauge type requires
+    (it has no native boolean).
+
+    "notebook_to_api_dashboard_compile_history_total"/
+    "..._deploy_history_total" are _read_compile_history()/
+    _read_deploy_history()'s own length -- the exact same entries GET
+    /api/compile/history/GET /api/deploy/history already page through,
+    just counted rather than returned.
+
+    "notebook_to_api_dashboard_uptime_seconds" is measured from
+    _DASHBOARD_START_TIME (this module's own import time, i.e. process
+    startup) -- the identical "process' own moment of birth" convention
+    every generated app's own START_TIME already uses for its own
+    uptime.
+
+    Deliberately unauthenticated, the same choice every generated app's
+    own GET /metrics/GET /metrics/prometheus/GET /health already make:
+    a Prometheus scrape target is hit unattended on a timer by a scraper
+    whose own config supports only a handful of fixed auth schemes, not
+    this dashboard's own bespoke rate-limiting (there is no API-key
+    concept on this dashboard at all, unlike a generated app), so
+    requiring one here would make this endpoint unreachable from a real
+    Prometheus instance's default configuration.
+    """
+
+    upload_root = Path(UPLOAD_DIR)
+
+    notebook_count = sum(
+        1 for entry in upload_root.iterdir()
+        if entry.is_file() and entry.suffix == ".ipynb"
+    ) if upload_root.is_dir() else 0
+
+    compiled_app_present = (Path(GENERATED_DIR) / "app.py").is_file()
+
+    uptime_seconds = time.time() - _DASHBOARD_START_TIME
+
+    body = (
+        "# HELP notebook_to_api_dashboard_notebooks_total Total number "
+        "of notebooks currently uploaded to this dashboard.\n"
+        "# TYPE notebook_to_api_dashboard_notebooks_total gauge\n"
+        f"notebook_to_api_dashboard_notebooks_total {notebook_count}\n"
+        "# HELP notebook_to_api_dashboard_compiled_app_present Whether "
+        "this dashboard currently has a compiled app ready to serve.\n"
+        "# TYPE notebook_to_api_dashboard_compiled_app_present gauge\n"
+        "notebook_to_api_dashboard_compiled_app_present "
+        f"{1 if compiled_app_present else 0}\n"
+        "# HELP notebook_to_api_dashboard_compile_history_total Total "
+        "number of compile history entries this dashboard has recorded.\n"
+        "# TYPE notebook_to_api_dashboard_compile_history_total gauge\n"
+        "notebook_to_api_dashboard_compile_history_total "
+        f"{len(_read_compile_history())}\n"
+        "# HELP notebook_to_api_dashboard_deploy_history_total Total "
+        "number of deploy history entries this dashboard has recorded.\n"
+        "# TYPE notebook_to_api_dashboard_deploy_history_total gauge\n"
+        "notebook_to_api_dashboard_deploy_history_total "
+        f"{len(_read_deploy_history())}\n"
+        "# HELP notebook_to_api_dashboard_uptime_seconds Seconds since "
+        "this dashboard process started.\n"
+        "# TYPE notebook_to_api_dashboard_uptime_seconds counter\n"
+        f"notebook_to_api_dashboard_uptime_seconds {uptime_seconds}\n"
+    )
+
+    return Response(
+        content=body, media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
 
 
 @router.get("/config")

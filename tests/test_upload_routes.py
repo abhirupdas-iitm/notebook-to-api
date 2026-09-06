@@ -23791,6 +23791,107 @@ def test_health_check_never_leaks_the_source_notebooks_server_side_filesystem_pa
     assert "uploads" not in json.dumps(resp.json())
 
 
+def test_dashboard_metrics_prometheus_requires_no_body_or_auth():
+
+    resp = client.get("/api/metrics/prometheus")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
+
+    body = resp.text
+    assert "# HELP notebook_to_api_dashboard_notebooks_total" in body
+    assert "# TYPE notebook_to_api_dashboard_notebooks_total gauge" in body
+    assert "# TYPE notebook_to_api_dashboard_uptime_seconds counter" in body
+    assert "notebook_to_api_dashboard_uptime_seconds " in body
+
+
+def test_dashboard_metrics_prometheus_reports_no_compiled_app_before_anything_has_been_compiled(
+    monkeypatch, tmp_path
+):
+
+    from backend.routes import upload as upload_module
+
+    empty_dir = tmp_path / "generated_metrics_empty_test"
+    empty_dir.mkdir()
+
+    monkeypatch.setattr(upload_module, "GENERATED_DIR", str(empty_dir))
+
+    resp = client.get("/api/metrics/prometheus")
+
+    assert resp.status_code == 200
+    assert "notebook_to_api_dashboard_compiled_app_present 0" in resp.text
+
+
+def test_dashboard_metrics_prometheus_reports_a_compiled_app():
+
+    _compile_a_notebook("metrics_prometheus_compiled_test.ipynb")
+
+    resp = client.get("/api/metrics/prometheus")
+
+    assert resp.status_code == 200
+    assert "notebook_to_api_dashboard_compiled_app_present 1" in resp.text
+
+
+def test_dashboard_metrics_prometheus_counts_uploaded_notebooks(monkeypatch, tmp_path):
+
+    from backend.routes import upload as upload_module
+
+    isolated_upload_dir = tmp_path / "metrics_notebooks_count_upload_dir"
+    isolated_upload_dir.mkdir()
+    monkeypatch.setattr(upload_module, "UPLOAD_DIR", str(isolated_upload_dir))
+
+    resp_before = client.get("/api/metrics/prometheus")
+    assert "notebook_to_api_dashboard_notebooks_total 0" in resp_before.text
+
+    for filename in ("metrics_count_a.ipynb", "metrics_count_b.ipynb"):
+        client.post(
+            "/api/upload",
+            files={
+                "file": (
+                    filename,
+                    io.BytesIO(_notebook_bytes("def f(): return 1\n")),
+                    "application/json",
+                )
+            },
+        )
+
+    resp_after = client.get("/api/metrics/prometheus")
+    assert "notebook_to_api_dashboard_notebooks_total 2" in resp_after.text
+
+
+def test_dashboard_metrics_prometheus_counts_deploy_and_compile_history(
+    monkeypatch, tmp_path
+):
+
+    from backend.routes import upload as upload_module
+
+    isolated_upload_dir = tmp_path / "metrics_history_upload_dir"
+    isolated_upload_dir.mkdir()
+    monkeypatch.setattr(upload_module, "UPLOAD_DIR", str(isolated_upload_dir))
+
+    resp_before = client.get("/api/metrics/prometheus")
+    assert "notebook_to_api_dashboard_compile_history_total 0" in resp_before.text
+    assert "notebook_to_api_dashboard_deploy_history_total 0" in resp_before.text
+
+    upload_module._append_compile_history_entry({
+        "compiled_at": "2024-01-01T00:00:00+00:00",
+        "source_notebook_filename": "a.ipynb",
+        "source_notebook_sha256": "a" * 64,
+    })
+    upload_module._append_deploy_history_entry({
+        "deployed_at": "2024-01-01T00:00:00+00:00",
+        "tag": "a:latest",
+        "platform": None,
+        "pushed": False,
+        "source_notebook_filename": "a.ipynb",
+        "source_notebook_sha256": "a" * 64,
+    })
+
+    resp_after = client.get("/api/metrics/prometheus")
+    assert "notebook_to_api_dashboard_compile_history_total 1" in resp_after.text
+    assert "notebook_to_api_dashboard_deploy_history_total 1" in resp_after.text
+
+
 def test_export_sdk_waits_for_an_in_flight_compile_to_release_compile_lock():
     """Confirmed missing before this fix: unlike export-openapi, deploy,
     download, and get_generated_file (see the identical tests above),
