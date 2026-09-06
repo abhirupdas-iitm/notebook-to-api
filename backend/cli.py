@@ -601,6 +601,35 @@ def _parse_comma_separated_names(value):
     return names or None
 
 
+def _parse_import_url_headers(header_args):
+    """Parse `import-url`'s own repeatable --header "NAME:VALUE" values
+    into the dict POST /api/notebooks/import-url's own "headers" body
+    field expects.
+
+    Split on the *first* ":" only, so a header value that itself contains
+    a colon (an "Authorization: Bearer <token>" value never has one, but
+    a URL-shaped value in some other header could) isn't truncated.
+    Leading/trailing whitespace around both the name and value is
+    stripped -- "--header \"Authorization: Bearer x\"" (a space after the
+    colon, the natural way to type one) must produce the value "Bearer x",
+    not " Bearer x".
+    """
+    headers = {}
+
+    for header_arg in header_args:
+
+        name, separator, value = header_arg.partition(":")
+
+        if not separator:
+            raise ValueError(
+                f"--header value {header_arg!r} must be in NAME:VALUE form"
+            )
+
+        headers[name.strip()] = value.strip()
+
+    return headers
+
+
 def _run_local_compile_smoke_test(package_name, output_dir):
     """`compile --smoke-test`'s own local counterpart to
     _run_compile_smoke_test (backend/routes/upload.py) -- actually
@@ -1670,6 +1699,8 @@ def _dispatch_core_command(args):
             body["expected_sha256"] = args.expected_sha256
         if args.dry_run:
             body["dry_run"] = True
+        if args.headers:
+            body["headers"] = _parse_import_url_headers(args.headers)
 
         try:
             response = httpx.post(
@@ -6783,6 +6814,21 @@ def main():
             "Fetch the URL and report what would happen -- without "
             "saving anything -- via POST /api/notebooks/import-url's own "
             "\"dry_run\" body field."
+        )
+    )
+    import_url_parser.add_argument(
+        "--header",
+        action="append",
+        dest="headers",
+        metavar="NAME:VALUE",
+        help=(
+            "An HTTP header to send with the fetch, as NAME:VALUE (e.g. "
+            "--header \"Authorization: Bearer <token>\") -- via POST "
+            "/api/notebooks/import-url's own \"headers\" body field, "
+            "letting a private GitHub raw URL or an internal artifact "
+            "server's own API key actually be reached. Repeat to send "
+            "more than one; only ever sent to the URL's own original "
+            "host -- dropped on any redirect to a different one."
         )
     )
     import_url_parser.add_argument(

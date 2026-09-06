@@ -3184,6 +3184,59 @@ def test_import_url_command_passes_optional_fields_through(tmp_path, fake_dashbo
     }
 
 
+def test_import_url_command_passes_headers_through(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success",
+            "filename": "nb.ipynb",
+            "path": "/srv/uploads/nb.ipynb",
+            "overwritten": False,
+            "sha256": "a" * 64,
+            "dry_run": False,
+            "source_url": "https://example.com/nb.ipynb",
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "import-url", "https://example.com/nb.ipynb",
+            "--dashboard-url", dashboard_url,
+            "--header", "Authorization: Bearer secret-token",
+            "--header", "X-Custom:value",
+        ],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    body = json.loads(handler.bodies[0])
+    assert body["headers"] == {
+        "Authorization": "Bearer secret-token",
+        "X-Custom": "value",
+    }
+
+
+def test_import_url_command_reports_a_clean_error_for_a_malformed_header(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "import-url", "https://example.com/nb.ipynb",
+            "--header", "not-a-header",
+        ],
+        cwd=workdir,
+    )
+
+    _assert_clean_cli_error(proc, "NAME:VALUE")
+
+
 def test_import_url_command_json_flag_emits_the_dashboards_own_response(
     tmp_path, fake_dashboard
 ):

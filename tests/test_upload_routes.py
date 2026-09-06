@@ -2590,8 +2590,18 @@ class _NotebookUrlHandler(http.server.BaseHTTPRequestHandler):
 
     content = b""
     redirect_to = None
+    # One entry per request this handler (or any other server sharing
+    # this same class -- see test_import_url_drops_custom_headers_after_a_cross_origin_redirect
+    # below, which spins up a second server from this identical class
+    # specifically so its own request headers land in this same shared
+    # log) actually received, in request order -- lets a test tell hop 1's
+    # own headers apart from hop 2's after a redirect, rather than only
+    # ever seeing whichever request happened to run last.
+    received_headers_log = None
 
     def do_GET(self):
+
+        type(self).received_headers_log.append(dict(self.headers))
 
         if self.path == "/redirect" and type(self).redirect_to:
             self.send_response(302)
@@ -2614,6 +2624,7 @@ class _NotebookUrlHandler(http.server.BaseHTTPRequestHandler):
 def notebook_url_server():
     _NotebookUrlHandler.content = b""
     _NotebookUrlHandler.redirect_to = None
+    _NotebookUrlHandler.received_headers_log = []
 
     server = http.server.HTTPServer(("127.0.0.1", 0), _NotebookUrlHandler)
     port = server.server_address[1]
@@ -2907,6 +2918,192 @@ def test_import_url_rechecks_the_ssrf_guard_on_every_redirect_hop(
     assert resp.json()["detail"] == "blocked by test guard"
     assert checked_urls == [f"{base_url}/redirect", "http://127.0.0.1:1/evil.ipynb"]
     assert not (Path(UPLOAD_DIR) / "evil.ipynb").exists()
+
+
+def test_import_url_forwards_custom_headers_to_the_fetch(
+    notebook_url_server, _bypass_import_url_ssrf_guard
+):
+    """Before this feature, there was no way to authenticate the fetch
+    POST /api/notebooks/import-url performs at all -- a private GitHub
+    raw URL, or an internal artifact server behind its own API key, had
+    no way to be imported short of the two-step "download it yourself,
+    then POST /api/upload it" round trip this endpoint's own docstring
+    already says it exists to avoid.
+    """
+
+    base_url, handler = notebook_url_server
+    handler.content = _notebook_bytes("def f(): return 1\n")
+
+    resp = client.post(
+        "/api/notebooks/import-url",
+        json={
+            "url": f"{base_url}/nb.ipynb",
+            "filename": "custom_headers.ipynb",
+            "headers": {"Authorization": "Bearer secret-token"},
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    [received] = handler.received_headers_log
+    assert received.get("Authorization") == "Bearer secret-token"
+
+
+def test_import_url_forwards_headers_across_a_same_origin_redirect(
+    notebook_url_server, _bypass_import_url_ssrf_guard
+):
+
+    base_url, handler = notebook_url_server
+    handler.content = _notebook_bytes("def f(): return 1\n")
+    handler.redirect_to = f"{base_url}/final.ipynb"
+
+    resp = client.post(
+        "/api/notebooks/import-url",
+        json={
+            "url": f"{base_url}/redirect",
+            "filename": "same_origin_headers.ipynb",
+            "headers": {"Authorization": "Bearer secret-token"},
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    redirect_hop, final_hop = handler.received_headers_log
+    assert redirect_hop.get("Authorization") == "Bearer secret-token"
+    assert final_hop.get("Authorization") == "Bearer secret-token"
+
+
+def test_import_url_drops_custom_headers_after_a_cross_origin_redirect(
+    notebook_url_server, _bypass_import_url_ssrf_guard
+):
+    """A redirect can land anywhere -- a host under an attacker's control,
+    or simply somewhere the caller never intended -- so a caller-supplied
+    credential meant for the *original* host must never follow it there,
+    the same one-way "never forward credentials across an origin change"
+    discipline requests/browsers already apply to a redirected
+    Authorization header.
+
+    The second server below is a distinct process-level listener on its
+    own port, but deliberately shares _NotebookUrlHandler's own class
+    (not a second, independent handler) specifically so its own request
+    lands in the exact same received_headers_log the first server's own
+    requests do -- letting this test tell hop 1's headers (sent to the
+    original, trusted host) apart from hop 2's (sent to a different host
+    entirely) from that one shared log, in request order.
+    """
+
+    base_url, handler = notebook_url_server
+    handler.content = b"unused -- the redirect target serves the real content"
+
+    second_server = http.server.HTTPServer(("127.0.0.1", 0), _NotebookUrlHandler)
+    second_port = second_server.server_address[1]
+    second_thread = threading.Thread(target=second_server.serve_forever, daemon=True)
+    second_thread.start()
+
+    try:
+        _NotebookUrlHandler.content = _notebook_bytes("def f(): return 1\n")
+        handler.redirect_to = f"http://127.0.0.1:{second_port}/nb.ipynb"
+
+        resp = client.post(
+            "/api/notebooks/import-url",
+            json={
+                "url": f"{base_url}/redirect",
+                "filename": "cross_origin_headers.ipynb",
+                "headers": {"Authorization": "Bearer secret-token"},
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        redirect_hop, final_hop = handler.received_headers_log
+        assert redirect_hop.get("Authorization") == "Bearer secret-token"
+        assert "Authorization" not in final_hop
+    finally:
+        second_server.shutdown()
+        second_thread.join(timeout=5)
+
+
+def test_import_url_rejects_a_non_object_headers_value(
+    notebook_url_server, _bypass_import_url_ssrf_guard
+):
+
+    base_url, handler = notebook_url_server
+    handler.content = _notebook_bytes("def f(): return 1\n")
+
+    resp = client.post(
+        "/api/notebooks/import-url",
+        json={"url": f"{base_url}/nb.ipynb", "headers": "not-an-object"},
+    )
+
+    assert resp.status_code == 400
+    assert "headers must be an object" in resp.json()["detail"]
+
+
+def test_import_url_rejects_a_headers_value_with_a_non_string_entry(
+    notebook_url_server, _bypass_import_url_ssrf_guard
+):
+
+    base_url, handler = notebook_url_server
+    handler.content = _notebook_bytes("def f(): return 1\n")
+
+    resp = client.post(
+        "/api/notebooks/import-url",
+        json={"url": f"{base_url}/nb.ipynb", "headers": {"X-Count": 5}},
+    )
+
+    assert resp.status_code == 400
+    assert "headers must be an object" in resp.json()["detail"]
+
+
+def test_import_url_rejects_too_many_headers(
+    notebook_url_server, _bypass_import_url_ssrf_guard
+):
+
+    base_url, handler = notebook_url_server
+    handler.content = _notebook_bytes("def f(): return 1\n")
+
+    too_many_headers = {f"X-Header-{i}": "value" for i in range(21)}
+
+    resp = client.post(
+        "/api/notebooks/import-url",
+        json={"url": f"{base_url}/nb.ipynb", "headers": too_many_headers},
+    )
+
+    assert resp.status_code == 400
+    assert "must not contain more than" in resp.json()["detail"]
+
+
+def test_import_url_rejects_an_oversized_header_value(
+    notebook_url_server, _bypass_import_url_ssrf_guard
+):
+
+    base_url, handler = notebook_url_server
+    handler.content = _notebook_bytes("def f(): return 1\n")
+
+    resp = client.post(
+        "/api/notebooks/import-url",
+        json={
+            "url": f"{base_url}/nb.ipynb",
+            "headers": {"X-Big": "a" * 4097},
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "must not exceed" in resp.json()["detail"]
+
+
+def test_import_url_without_headers_field_behaves_exactly_as_before(
+    notebook_url_server, _bypass_import_url_ssrf_guard
+):
+
+    base_url, handler = notebook_url_server
+    handler.content = _notebook_bytes("def f(): return 1\n")
+
+    resp = client.post(
+        "/api/notebooks/import-url",
+        json={"url": f"{base_url}/nb.ipynb", "filename": "no_headers.ipynb"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    [received] = handler.received_headers_log
+    assert "Authorization" not in received
 
 
 def test_import_url_rejects_content_over_the_configured_max_size(

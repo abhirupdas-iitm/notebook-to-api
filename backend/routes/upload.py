@@ -232,6 +232,20 @@ URL_IMPORT_TIMEOUT_SECONDS = float(
 # tune.
 _URL_IMPORT_MAX_REDIRECTS = 5
 
+# Bounds POST /api/notebooks/import-url's own optional "headers" (see
+# _download_url_for_import below) -- a caller importing from a private
+# GitHub raw URL, or an internal artifact server behind its own API key,
+# has no way to authenticate that fetch at all without this, short of the
+# same two-step "download it yourself, then POST /api/upload it" round
+# trip that endpoint's own docstring already says this feature exists to
+# avoid. Bounded (count and per-value length) the same way every other
+# client-supplied collection/string in this file already is (see
+# _MAX_TAGS_PER_NOTEBOOK/_MAX_TAG_LENGTH below) -- an unbounded header
+# dict could otherwise be used to build an outsized outbound request with
+# no real caller-facing purpose.
+_MAX_IMPORT_URL_HEADERS = 20
+_MAX_IMPORT_URL_HEADER_LENGTH = 4096
+
 # Same NOTEBOOK_API_* convention as MAX_UPLOAD_BYTES above. Without this,
 # POST /api/upload/batch (see upload_notebooks_batch below) accepted a
 # multipart request with any number of files at all -- a single request
@@ -2010,7 +2024,25 @@ def _reject_unsafe_import_url_host(url):
             )
 
 
-async def _download_url_for_import(url):
+def _url_origin(url):
+    """(scheme, hostname, port) for `url`, with a default port filled in
+    per scheme when none is explicit -- used by _download_url_for_import
+    below to decide whether a redirect hop still shares the original
+    request's own origin, the same (scheme, host, port) triple a browser's
+    own same-origin policy is built from. Filling in the default port
+    (80 for http, 443 for https) means "http://example.com" and
+    "http://example.com:80" compare equal, rather than a redirect that
+    merely makes an implicit port explicit being wrongly treated as a
+    cross-origin hop.
+    """
+    parsed = urlsplit(url)
+
+    default_port = {"http": 80, "https": 443}.get(parsed.scheme)
+
+    return (parsed.scheme, parsed.hostname, parsed.port or default_port)
+
+
+async def _download_url_for_import(url, headers=None):
     """Fetch `url`'s full response body into memory for POST
     /api/notebooks/import-url below, capped at MAX_UPLOAD_BYTES -- the
     same limit POST /api/upload's own streamed write already enforces,
@@ -2032,8 +2064,25 @@ async def _download_url_for_import(url):
     httpx's own automatic redirect-following has no hook to do -- a
     public URL that 3xx's to an internal address must be caught exactly
     as if that internal address had been the original URL itself.
+
+    `headers` (optional) is POST /api/notebooks/import-url's own caller-
+    supplied "headers" -- an Authorization token for a private GitHub raw
+    URL, or an API key an internal artifact server expects, neither of
+    which this caller would otherwise have any way to attach to a fetch
+    only this server itself performs. Only ever sent while a redirect hop
+    still shares `url`'s own original (scheme, hostname, port) origin: a
+    redirect to a different host, a different port, or even just a
+    downgrade from https to http silently drops them for that hop and
+    every one after it, the same one-way "never forward credentials
+    across an origin change" discipline requests/browsers already apply
+    to a redirected Authorization header -- without it, a host under an
+    attacker's control (or simply a redirect chain ending somewhere the
+    caller never intended, or an on-path attacker forcing a downgrade to
+    plaintext) could 3xx this request to itself and receive a secret the
+    caller only ever meant for the URL they actually gave.
     """
     current_url = url
+    original_origin = _url_origin(url)
 
     try:
 
@@ -2045,7 +2094,15 @@ async def _download_url_for_import(url):
 
                 _reject_unsafe_import_url_host(current_url)
 
-                async with client.stream("GET", current_url) as response:
+                request_headers = (
+                    headers
+                    if headers and _url_origin(current_url) == original_origin
+                    else None
+                )
+
+                async with client.stream(
+                    "GET", current_url, headers=request_headers
+                ) as response:
 
                     if response.status_code in (301, 302, 303, 307, 308):
 
@@ -2185,6 +2242,20 @@ async def import_notebook_from_url(data: dict):
     the same requirement _save_uploaded_notebook already enforces for
     POST /api/upload's own "file.filename".
 
+    "headers" (optional, an object of string header names to string
+    values -- at most _MAX_IMPORT_URL_HEADERS entries, each at most
+    _MAX_IMPORT_URL_HEADER_LENGTH characters) is sent with the outbound
+    fetch, so a private GitHub raw URL's own "Authorization: Bearer ..."
+    or an internal artifact server's own API-key header can actually be
+    attached to a fetch only this server performs -- before this, that
+    was only reachable via the exact two-step "download it yourself,
+    then POST /api/upload it" round trip this endpoint's own docstring
+    already says it exists to avoid. Forwarded only to "url"'s own
+    original host: a redirect to a different host silently drops them
+    for that hop and every one after it (see _download_url_for_import's
+    own docstring), so a redirect chain can never walk a caller's own
+    credential to a host they never intended to share it with.
+
     "overwrite"/"tags"/"description"/"expected_sha256" are the identical
     optional fields POST /api/upload already accepts, applied the same
     way: "overwrite" (default false) permits replacing an already-
@@ -2255,6 +2326,45 @@ async def import_notebook_from_url(data: dict):
             detail="expected_sha256 must be a string"
         )
 
+    request_headers = data.get("headers")
+
+    if request_headers is not None:
+
+        if not isinstance(request_headers, dict) or not all(
+            isinstance(name, str) and isinstance(value, str)
+            for name, value in request_headers.items()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "headers must be an object of string header names to "
+                    "string values"
+                )
+            )
+
+        if len(request_headers) > _MAX_IMPORT_URL_HEADERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "headers must not contain more than "
+                    f"{_MAX_IMPORT_URL_HEADERS} entries"
+                )
+            )
+
+        for name, value in request_headers.items():
+
+            if (
+                len(name) > _MAX_IMPORT_URL_HEADER_LENGTH
+                or len(value) > _MAX_IMPORT_URL_HEADER_LENGTH
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "each header name/value must not exceed "
+                        f"{_MAX_IMPORT_URL_HEADER_LENGTH} characters"
+                    )
+                )
+
     tags = data.get("tags")
 
     if tags is not None and not isinstance(tags, str):
@@ -2280,7 +2390,9 @@ async def import_notebook_from_url(data: dict):
             detail="filename must end with .ipynb"
         )
 
-    final_url, content_bytes = await _download_url_for_import(url)
+    final_url, content_bytes = await _download_url_for_import(
+        url, headers=request_headers
+    )
 
     upload_file = UploadFile(
         file=io.BytesIO(content_bytes), filename=filename
