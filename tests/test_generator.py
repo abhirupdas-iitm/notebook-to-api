@@ -670,6 +670,33 @@ def test_notebook_function_named_rate_limit_windows_is_rejected():
         generate_fastapi_code(functions)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "hmac", "uuid", "time", "jsonable_encoder", "Depends", "BackgroundTasks",
+        "HTTPException", "Optional", "get_openapi", "urlparse",
+    ],
+)
+def test_notebook_function_named_after_a_reserved_import_is_rejected(name):
+    """Every one of these is a plain top-level `import` this file itself
+    makes -- never previously reserved at all, on the untested assumption
+    that only names this file *defines* (a constant, a helper) were at
+    risk. A notebook function later defined with the same name rebinds
+    the import exactly the same way `TASKS = {}` gets rebound by a
+    colliding constant name -- and each of these is read back by that
+    same bare name, at call time, from somewhere every request (or every
+    background one) actually reaches. See RESERVED_INFRASTRUCTURE_NAMES'
+    own comment for exactly what each one breaks when shadowed -- from a
+    500 on a completely unrelated endpoint (hmac, jsonable_encoder) to
+    the entire generated module failing to import at all (Optional).
+    """
+
+    functions = [{"name": name, "args": [], "return_type": "dict"}]
+
+    with pytest.raises(ReservedFunctionNameError, match=name):
+        generate_fastapi_code(functions)
+
+
 def test_background_endpoint_rejects_new_tasks_past_max_pending_tasks():
     """_evict_expired_tasks bounds TASKS' long-term growth, but a burst of
     background requests arriving faster than TASK_TTL_SECONDS still grew

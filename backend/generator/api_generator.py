@@ -89,6 +89,82 @@ RESERVED_INFRASTRUCTURE_NAMES = frozenset({
     # _evict_expired_tasks() missing 1 required positional argument:
     # 'req'", nothing to do with train_model's own logic at all.
     "_evict_expired_tasks", "_run_background_task",
+    # Every name below is one of this file's own top-level `import`s --
+    # never previously reserved at all, on the (never actually verified)
+    # assumption that only names *this file itself defines* (a constant,
+    # a helper, an endpoint) were at risk. They aren't special: `import
+    # hmac` binds the name "hmac" in this exact module's own namespace
+    # the same way `TASKS = {}` binds "TASKS" -- a notebook function
+    # later defined with that same name rebinds it exactly the same way,
+    # and every *later* reference to it by name (inside a function body,
+    # resolved at call time) resolves to whatever it was rebound to.
+    # Confirmed exploitable, one at a time, against a real generated app
+    # -- not merely reasoned about -- since whether a given import is
+    # actually reachable this way depends entirely on where in the file
+    # it's used relative to where a notebook's own colliding function
+    # gets defined, which varies name to name:
+    #   - "hmac": verify_api_key's own hmac.compare_digest(...) call,
+    #     reached via Depends(verify_api_key) on literally every
+    #     endpoint -- a collision crashed a *different*, unrelated
+    #     endpoint with "'function' object has no attribute
+    #     'compare_digest'", the same class of "one bad name takes down
+    #     every endpoint" exposure _enforce_rate_limit's own entry above
+    #     already documents.
+    #   - "uuid"/"time": both read by name inside middleware that runs
+    #     on literally every response (_add_request_id_header's own
+    #     uuid.uuid4(), a process-time header's own time.perf_counter())
+    #     -- a collision broke even GET /health, an endpoint with no
+    #     relationship to the colliding name at all.
+    #   - "jsonable_encoder": called on *every* synchronous endpoint's
+    #     own return value before it's ever sent back -- a collision
+    #     turned an entirely successful `add(1, 2) -> 3` into a 500
+    #     ("'add' returned a value that is not JSON-serializable").
+    #   - "Depends": used as every notebook endpoint's own
+    #     `Depends(verify_api_key)` parameter default, evaluated at
+    #     *def* time -- a notebook function literally named "Depends",
+    #     compiled ahead of another in the same notebook, silently
+    #     replaced the real FastAPI dependency marker for every endpoint
+    #     defined afterward, breaking request handling with no relation
+    #     to either colliding function's own logic.
+    #   - "BackgroundTasks": the type annotation every background
+    #     endpoint's own `background_tasks: BackgroundTasks` parameter
+    #     declares -- a collision made FastAPI treat it as a plain query
+    #     parameter instead of its own request-scoped injection,
+    #     rejecting every call to that endpoint with a 422 demanding a
+    #     "background_tasks" query value no real caller would ever send.
+    #   - "HTTPException": raised throughout this file's own generated
+    #     validation code (a background endpoint's own callback_url
+    #     scheme check among others) -- a collision turned a caller's
+    #     own invalid input into an unhandled "HTTPException() got an
+    #     unexpected keyword argument 'status_code'" instead of the
+    #     clean 400 that input should have produced.
+    #   - "Optional": used in a background endpoint's own `callback_url:
+    #     Optional[str] = None` parameter annotation -- a collision here
+    #     was the most severe of all: it crashed *loading the generated
+    #     module itself* ("'function' object is not subscriptable"),
+    #     taking down the entire app before it could serve a single
+    #     request, not merely one endpoint.
+    #   - "get_openapi": called by custom_openapi() (itself cached and
+    #     invoked the first time anything requests the schema -- /docs,
+    #     /openapi.json, or a client introspecting it) -- a collision
+    #     broke the schema entirely with "get_openapi() got an
+    #     unexpected keyword argument 'title'".
+    #   - "urlparse": used to validate a background endpoint's own
+    #     callback_url scheme -- a collision turned that same validation
+    #     path into an unhandled 500 instead of a clean 400.
+    # Every other top-level import (os, sys, json, FastAPI, BaseModel,
+    # CORSMiddleware, GZipMiddleware, Field, Header, Query, Response,
+    # JSONResponse, anyio, datetime, functools, inspect, urllib) was
+    # individually tested the identical way and confirmed *not* reachable
+    # this way in practice -- each is only
+    # ever used at module-load time (a one-shot constructor call, a
+    # default argument value on an endpoint already defined earlier than
+    # any notebook function could be) rather than read back by name
+    # later, so a notebook function reusing one of those names is
+    # confirmed harmless today. Not reserving them is a deliberate,
+    # verified choice, not an oversight matching the ones above.
+    "hmac", "uuid", "time", "jsonable_encoder", "Depends", "BackgroundTasks",
+    "HTTPException", "Optional", "get_openapi", "urlparse",
 })
 
 
