@@ -405,6 +405,46 @@ def test_compile_command_only_accepts_a_comma_separated_list(tmp_path):
     assert '"/subtract"' not in generated_app
 
 
+def test_compile_command_reports_a_clean_error_for_a_non_python_notebook(tmp_path):
+    """Confirmed exploitable before this fix: every cell of a genuinely
+    non-Python notebook (its own kernelspec.language declaring "R", say)
+    simply failed is_parseable_python and was silently dropped --
+    `compile` "succeeded" with zero extracted functions, producing a
+    working-but-endpoint-less app with nothing anywhere explaining why it
+    exposed nothing.
+    """
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    notebook_path.write_text(
+        json.dumps({
+            "nbformat": 4,
+            "nbformat_minor": 5,
+            "metadata": {
+                "kernelspec": {
+                    "name": "ir", "display_name": "R", "language": "R",
+                },
+            },
+            "cells": [{
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": "f <- function(x) x + 1",
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    proc = _run_cli(
+        ["compile", str(notebook_path), "--output", "built"],
+        cwd=workdir,
+    )
+
+    _assert_clean_cli_error(proc, "not Python")
+
+
 def test_compile_command_only_and_exclude_together_reports_a_clean_error(tmp_path):
 
     workdir = tmp_path / "workdir"

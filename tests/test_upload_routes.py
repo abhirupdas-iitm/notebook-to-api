@@ -53,6 +53,15 @@ def _notebook_bytes(function_source):
     return nbformat.writes(notebook).encode("utf-8")
 
 
+def _non_python_notebook_bytes(cell_source="f <- function(x) x + 1"):
+    notebook = nbformat.v4.new_notebook()
+    notebook.metadata["kernelspec"] = {
+        "name": "ir", "display_name": "R", "language": "R",
+    }
+    notebook.cells.append(nbformat.v4.new_code_cell(cell_source))
+    return nbformat.writes(notebook).encode("utf-8")
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_uploaded_files():
     # Backs up full file contents, not just names -- test_delete_all_notebooks_*
@@ -474,6 +483,55 @@ def test_upload_rejects_content_that_is_not_a_valid_notebook():
 
     assert resp.status_code == 400
     assert not os.path.exists(os.path.join(UPLOAD_DIR, "garbage.ipynb"))
+
+
+def test_upload_rejects_a_notebook_with_a_non_python_kernel():
+    """Confirmed exploitable before this fix: a genuinely non-Python
+    notebook (its own kernelspec.language declaring "R", say) uploaded
+    and later "compiled" cleanly -- every one of its code cells simply
+    failed is_parseable_python and was silently dropped, producing a
+    working-but-endpoint-less API with nothing anywhere explaining why it
+    exposed nothing. Rejecting it at upload, the earliest point this
+    project's own MALFORMED_NOTEBOOK_ERRORS docstring already establishes
+    for a not-even-valid-JSON notebook, surfaces the real, specific
+    reason immediately instead.
+    """
+
+    resp = client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "r_notebook.ipynb",
+                io.BytesIO(_non_python_notebook_bytes()),
+                "application/json",
+            )
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "not Python" in resp.json()["detail"]
+    assert not os.path.exists(os.path.join(UPLOAD_DIR, "r_notebook.ipynb"))
+
+
+def test_compile_rejects_a_non_python_notebook_already_on_disk():
+    """POST /api/compile already validates with its own dedicated
+    load_notebook() call before doing anything else (see MALFORMED_NOTEBOOK_ERRORS'
+    own docstring) -- this notebook is written directly into UPLOAD_DIR,
+    bypassing POST /api/upload's own identical check, specifically to
+    confirm compile's own pre-check independently catches a non-Python
+    kernel too, not only upload's.
+    """
+
+    filename = "compile_non_python.ipynb"
+    file_path = os.path.join(UPLOAD_DIR, filename)
+
+    with open(file_path, "wb") as f:
+        f.write(_non_python_notebook_bytes())
+
+    compile_resp = client.post("/api/compile", json={"notebook_path": filename})
+
+    assert compile_resp.status_code == 400
+    assert "not Python" in compile_resp.json()["detail"]
 
 
 def test_upload_rejects_a_notebook_exceeding_the_configured_max_size(monkeypatch):

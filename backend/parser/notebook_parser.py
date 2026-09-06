@@ -134,9 +134,76 @@ def strip_magic_commands(source):
     return "\n".join(cleaned_lines)
 
 
+def notebook_kernel_language(notebook):
+    """The notebook's own declared kernel language (e.g. "python", "R",
+    "julia"), lowercased, or None if it doesn't declare one at all.
+
+    Checked in the same two places a real Jupyter frontend does, in the
+    same order of authority: "kernelspec.language" (nbformat's own
+    documented field for exactly this -- present on essentially every
+    notebook a real Jupyter frontend ever writes) first, falling back to
+    "language_info.name" (also standard, and sometimes present even when
+    kernelspec.language is missing or a custom kernel name doesn't
+    itself say much, e.g. "language": "R" under a kernelspec named
+    "ir"). Both are optional per the nbformat spec, and a hand-built or
+    stripped-down notebook -- most of this project's own test fixtures
+    among them -- commonly omits both metadata blocks entirely; this
+    returns None rather than guessing in that case, since there's no
+    honest way to tell "wasn't recorded" apart from "is Python" in the
+    metadata's own absence.
+    """
+    metadata = notebook.get("metadata") or {}
+
+    kernelspec = metadata.get("kernelspec") or {}
+    language = kernelspec.get("language")
+
+    if not language:
+
+        language_info = metadata.get("language_info") or {}
+        language = language_info.get("name")
+
+    return language.strip().lower() if language else None
+
+
 def load_notebook(notebook_path):
     with open(notebook_path, "r", encoding="utf-8") as f:
         notebook = nbformat.read(f, as_version=4)
+
+    # A real Jupyter notebook can carry any kernel at all -- R, Julia,
+    # Scala, ... -- but this tool only ever extracts *Python* functions
+    # from a cell's source (extract_functions_from_code parses it with
+    # ast.parse) and only ever runs them as Python inside the generated
+    # runtime module. Before this, uploading/compiling a genuinely
+    # non-Python notebook wasn't rejected anywhere: every one of its code
+    # cells simply failed is_parseable_python (a SyntaxError from
+    # ast.parse on, say, R's own `f <- function(x) x + 1` syntax) and was
+    # silently dropped -- compile_notebook_to_api "succeeded" with zero
+    # extracted functions, producing a working-but-endpoint-less API with
+    # nothing anywhere explaining *why* it exposed nothing. Raising here
+    # instead -- a plain ValueError, already part of every call site's own
+    # MALFORMED_NOTEBOOK_ERRORS/CLI_USER_FACING_ERRORS handling (see
+    # routes/upload.py and cli.py), so this needs no new exception
+    # handling of its own anywhere -- reports the real, specific reason up
+    # front, at the exact same "validate before doing anything else" point
+    # this project's own MALFORMED_NOTEBOOK_ERRORS docstring already
+    # establishes for a malformed (not-even-valid-JSON) notebook.
+    #
+    # Silently permissive (no language declared at all) rather than
+    # rejecting: a notebook's own kernelspec/language_info are both
+    # optional per the nbformat spec, and assuming Python in their
+    # absence preserves this function's previous behavior exactly for
+    # every notebook that doesn't declare a language either way --
+    # including, not incidentally, most of this project's own test
+    # fixtures (nbformat.v4.new_notebook() sets neither by default).
+    language = notebook_kernel_language(notebook)
+
+    if language and language not in ("python", "python3", "python2"):
+
+        raise ValueError(
+            f"This notebook's kernel language is '{language}', not "
+            "Python -- notebook-to-api only compiles Python notebooks "
+            "into an API."
+        )
 
     return notebook
 

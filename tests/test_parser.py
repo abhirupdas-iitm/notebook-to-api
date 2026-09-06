@@ -1,4 +1,5 @@
 import nbformat
+import pytest
 
 from backend.parser.ast_parser import extract_functions_from_code
 from backend.parser.notebook_parser import (
@@ -6,6 +7,7 @@ from backend.parser.notebook_parser import (
     extract_code_cells,
     strip_magic_commands,
     detect_non_python_body_cell_magic,
+    notebook_kernel_language,
 )
 
 
@@ -285,3 +287,139 @@ def test_extract_code_cells_strips_introspection_query_from_notebook():
     assert len(code_cells) == 1
     assert "# train_model?" in code_cells[0]
     assert "def train_model():" in code_cells[0]
+
+
+def _write_notebook_file(path, notebook):
+    with open(path, "w", encoding="utf-8") as f:
+        nbformat.write(notebook, f)
+
+
+def test_notebook_kernel_language_returns_none_without_kernelspec_or_language_info():
+    """Both fields are optional per the nbformat spec, and a hand-built or
+    stripped-down notebook -- most of this project's own test fixtures
+    among them, since nbformat.v4.new_notebook() sets neither by default
+    -- commonly omits them entirely. There's no honest way to tell
+    "wasn't recorded" apart from "is Python" in their own absence, so
+    this must return None rather than guessing.
+    """
+
+    notebook = nbformat.v4.new_notebook()
+
+    assert notebook_kernel_language(notebook) is None
+
+
+def test_notebook_kernel_language_reads_kernelspec_language():
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.metadata["kernelspec"] = {
+        "name": "ir", "display_name": "R", "language": "R",
+    }
+
+    assert notebook_kernel_language(notebook) == "r"
+
+
+def test_notebook_kernel_language_falls_back_to_language_info_name():
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.metadata["language_info"] = {"name": "Julia", "version": "1.9"}
+
+    assert notebook_kernel_language(notebook) == "julia"
+
+
+def test_notebook_kernel_language_prefers_kernelspec_over_language_info():
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.metadata["kernelspec"] = {
+        "name": "ir", "display_name": "R", "language": "R",
+    }
+    notebook.metadata["language_info"] = {"name": "python"}
+
+    assert notebook_kernel_language(notebook) == "r"
+
+
+def test_load_notebook_accepts_a_notebook_with_no_declared_language(tmp_path):
+    """The overwhelmingly common case for this project's own test
+    fixtures (see notebook_kernel_language's own docstring) -- must keep
+    working exactly as before this feature.
+    """
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.cells.append(
+        nbformat.v4.new_code_cell("def add(a, b):\n    return a + b")
+    )
+
+    path = tmp_path / "nb.ipynb"
+    _write_notebook_file(path, notebook)
+
+    loaded = load_notebook(str(path))
+
+    assert loaded is not None
+
+
+def test_load_notebook_accepts_a_notebook_declaring_python(tmp_path):
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.metadata["kernelspec"] = {
+        "name": "python3", "display_name": "Python 3", "language": "python",
+    }
+
+    path = tmp_path / "nb.ipynb"
+    _write_notebook_file(path, notebook)
+
+    loaded = load_notebook(str(path))
+
+    assert loaded is not None
+
+
+def test_load_notebook_rejects_a_non_python_kernel(tmp_path):
+    """Confirmed exploitable before this feature: every cell of a
+    genuinely non-Python notebook (R's own `f <- function(x) x + 1`
+    syntax, say) simply failed is_parseable_python and was silently
+    dropped -- compile_notebook_to_api "succeeded" with zero extracted
+    functions, producing a working-but-endpoint-less API with nothing
+    anywhere explaining why it exposed nothing.
+    """
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.metadata["kernelspec"] = {
+        "name": "ir", "display_name": "R", "language": "R",
+    }
+    notebook.cells.append(
+        nbformat.v4.new_code_cell("f <- function(x) x + 1")
+    )
+
+    path = tmp_path / "nb.ipynb"
+    _write_notebook_file(path, notebook)
+
+    with pytest.raises(ValueError, match="not Python"):
+        load_notebook(str(path))
+
+
+def test_load_notebook_rejects_a_non_python_language_info_with_no_kernelspec(
+    tmp_path
+):
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.metadata["language_info"] = {"name": "julia", "version": "1.9"}
+
+    path = tmp_path / "nb.ipynb"
+    _write_notebook_file(path, notebook)
+
+    with pytest.raises(ValueError, match="julia"):
+        load_notebook(str(path))
+
+
+def test_load_notebook_error_message_names_the_actual_language(tmp_path):
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.metadata["kernelspec"] = {
+        "name": "ir", "display_name": "R", "language": "R",
+    }
+
+    path = tmp_path / "nb.ipynb"
+    _write_notebook_file(path, notebook)
+
+    with pytest.raises(ValueError) as exc_info:
+        load_notebook(str(path))
+
+    assert "'r'" in str(exc_info.value)
