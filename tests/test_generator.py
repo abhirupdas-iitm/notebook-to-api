@@ -31,6 +31,7 @@ def test_generated_app_env_vars_default_matches_the_actual_generated_code():
         "NOTEBOOK_API_MAX_REQUEST_BYTES",
         "NOTEBOOK_API_TASK_TTL_SECONDS",
         "NOTEBOOK_API_MAX_TASKS",
+        "NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS",
         "NOTEBOOK_API_RATE_LIMIT_PER_MINUTE",
         "NOTEBOOK_API_WEBHOOK_TIMEOUT_SECONDS",
         "NOTEBOOK_API_WEBHOOK_SECRET",
@@ -1026,6 +1027,220 @@ def test_webhook_delivery_signature_changes_when_secret_changes(monkeypatch):
     signature_b = _deliver_with_secret("secret-b")
 
     assert signature_a != signature_b
+
+
+def test_notebook_function_named_task_execution_timeout_seconds_is_rejected():
+    """TASK_EXECUTION_TIMEOUT_SECONDS is a module-level name the generated
+    app itself defines (see RESERVED_INFRASTRUCTURE_NAMES) -- same
+    collision hazard class as WEBHOOK_TIMEOUT_SECONDS or MAX_PENDING_TASKS.
+    """
+
+    functions = [
+        {"name": "TASK_EXECUTION_TIMEOUT_SECONDS", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="TASK_EXECUTION_TIMEOUT_SECONDS"):
+        generate_fastapi_code(functions)
+
+
+def test_background_sync_task_hanging_past_the_timeout_is_marked_failed(monkeypatch):
+    """Confirmed exploitable before this feature: a hung or runaway
+    notebook function (an infinite loop, a network call with no timeout
+    of its own) tied up one of this process' limited worker threads
+    forever -- the same threadpool every *synchronous* endpoint (GET
+    /health included) also runs on, so enough hung tasks would eventually
+    starve the entire app, not just background ones.
+    """
+    import time as time_module
+
+    monkeypatch.setenv("NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS", "1")
+
+    functions = [{"name": "train_model", "args": [], "return_type": "dict"}]
+
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["notebook_module"].train_model = lambda: time_module.sleep(30)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    start = time_module.monotonic()
+    response = client.post("/train_model", json={}, headers=headers)
+    elapsed = time_module.monotonic() - start
+
+    assert response.status_code == 200
+    # abandon_on_cancel=True is what makes this assertion meaningful: the
+    # orphaned thread itself keeps sleeping for the full 30s in the
+    # background, but this request -- and the coroutine awaiting it --
+    # must not be held up waiting for it.
+    assert elapsed < 30
+
+    task_id = response.json()["task_id"]
+    task = namespace["TASKS"][task_id]
+    assert task["status"] == "failed"
+    assert "1s" in task["error"]
+    assert "execution timeout" in task["error"]
+
+
+def test_background_async_task_hanging_past_the_timeout_is_marked_failed(monkeypatch):
+
+    import asyncio
+
+    monkeypatch.setenv("NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS", "1")
+
+    functions = [{"name": "process_data", "args": [], "return_type": "dict"}]
+
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+
+    async def _hangs_forever():
+        await asyncio.sleep(30)
+
+    namespace["notebook_module"].process_data = _hangs_forever
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    response = client.post("/process_data", json={}, headers=headers)
+
+    assert response.status_code == 200
+    task_id = response.json()["task_id"]
+    task = namespace["TASKS"][task_id]
+    assert task["status"] == "failed"
+    assert "execution timeout" in task["error"]
+
+
+def test_background_task_timeout_delivers_a_failed_webhook(monkeypatch):
+
+    import time as time_module
+    import urllib.request
+
+    monkeypatch.setenv("NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS", "1")
+
+    functions = [{"name": "train_model", "args": [], "return_type": "dict"}]
+
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["notebook_module"].train_model = lambda: time_module.sleep(30)
+
+    delivered = []
+
+    class _FakeResponse:
+        def close(self):
+            pass
+
+    def fake_urlopen(request, timeout=None):
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    response = client.post(
+        "/train_model",
+        json={},
+        params={"callback_url": "https://example.test/hook"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+
+    assert len(delivered) == 1
+    assert delivered[0]["status"] == "failed"
+    assert "execution timeout" in delivered[0]["error"]
+
+
+def test_background_task_disabled_timeout_preserves_unbounded_execution(monkeypatch):
+    """0 (the default) must behave exactly as before this feature existed
+    -- a slow-but-finite task still completes normally, never cut off.
+    """
+    import time as time_module
+
+    monkeypatch.delenv("NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS", raising=False)
+
+    functions = [{"name": "train_model", "args": [], "return_type": "str"}]
+
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["notebook_module"].train_model = lambda: (
+        time_module.sleep(0.3) or "done"
+    )
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    response = client.post("/train_model", json={}, headers=headers)
+
+    assert response.status_code == 200
+    task_id = response.json()["task_id"]
+    task = namespace["TASKS"][task_id]
+    assert task["status"] == "completed"
+    assert task["result"] == "done"
+
+
+def test_generated_app_get_config_reports_task_execution_timeout_seconds(monkeypatch):
+
+    monkeypatch.setenv("NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS", "45")
+
+    functions = [{"name": "add", "args": [], "return_type": "int"}]
+    code = generate_fastapi_code(functions)
+
+    assert "'task_execution_timeout_seconds': TASK_EXECUTION_TIMEOUT_SECONDS or None," in code
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    resp = client.get("/config")
+
+    assert resp.status_code == 200
+    assert resp.json()["task_execution_timeout_seconds"] == 45
+
+
+def test_generated_app_get_config_reports_null_task_execution_timeout_by_default(
+    monkeypatch
+):
+
+    monkeypatch.delenv("NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS", raising=False)
+
+    functions = [{"name": "add", "args": [], "return_type": "int"}]
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    resp = client.get("/config")
+
+    assert resp.status_code == 200
+    assert resp.json()["task_execution_timeout_seconds"] is None
 
 
 def test_route_generation():

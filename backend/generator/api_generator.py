@@ -18,6 +18,7 @@ RESERVED_INFRASTRUCTURE_NAMES = frozenset({
     "PUBLIC_URL", "DISABLE_DOCS",
     "MAX_REQUEST_BODY_BYTES", "MaxRequestBodySizeMiddleware",
     "MAX_PENDING_TASKS", "WEBHOOK_TIMEOUT_SECONDS", "WEBHOOK_SECRET",
+    "TASK_EXECUTION_TIMEOUT_SECONDS",
     "_deliver_task_webhook",
     "verify_api_key", "custom_openapi",
     "root", "health_check", "readiness_check", "auth_status", "auth_info",
@@ -114,6 +115,22 @@ GENERATED_APP_ENV_VARS = [
             "Maximum number of background tasks pending at once -- a "
             "new one submitted while at this limit is rejected with 503 "
             "until some already-tracked tasks are evicted."
+        ),
+    },
+    {
+        "name": "NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS",
+        "default": "0",
+        "description": (
+            "Maximum seconds a single background task's own execution "
+            "may run before it's cancelled and marked 'failed' with a "
+            "timeout error. Without this, a hung or runaway notebook "
+            "function (an infinite loop, a network call with no timeout "
+            "of its own) ties up one of this process' limited worker "
+            "threads forever -- the same threadpool every *synchronous* "
+            "endpoint (including GET /health) also runs on, so enough "
+            "hung tasks eventually starve the entire app, not just "
+            "background ones. 0 (the default) disables this entirely, "
+            "preserving the previous unbounded-execution-time behavior."
         ),
     },
     {
@@ -819,6 +836,17 @@ def generate_fastapi_code(
         f'"{_generated_app_env_var_default("NOTEBOOK_API_MAX_TASKS")}"'
         '))'
     )
+    # Bounds _run_background_task's own single execution below (see its
+    # own docstring) -- 0 (the default) disables this entirely, the
+    # identical "0 means off, preserving the previous unbounded behavior"
+    # convention RATE_LIMIT_PER_MINUTE/MAX_PENDING_TASKS's own defaults
+    # already follow.
+    lines.append(
+        'TASK_EXECUTION_TIMEOUT_SECONDS = int(os.getenv('
+        '"NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS", '
+        f'"{_generated_app_env_var_default("NOTEBOOK_API_TASK_EXECUTION_TIMEOUT_SECONDS")}"'
+        '))'
+    )
     # Bounds _deliver_task_webhook's own single delivery attempt below --
     # a caller-supplied ?callback_url= pointing at a slow or unresponsive
     # endpoint must never be allowed to tie up a worker thread (and, by
@@ -1245,6 +1273,10 @@ def generate_fastapi_code(
     lines.append("        'max_request_body_bytes': MAX_REQUEST_BODY_BYTES,")
     lines.append("        'task_ttl_seconds': TASK_TTL_SECONDS,")
     lines.append("        'max_pending_tasks': MAX_PENDING_TASKS,")
+    lines.append(
+        "        'task_execution_timeout_seconds': "
+        "TASK_EXECUTION_TIMEOUT_SECONDS or None,"
+    )
     lines.append("        'webhook_timeout_seconds': WEBHOOK_TIMEOUT_SECONDS,")
     lines.append("        'webhook_signing_enabled': bool(WEBHOOK_SECRET),")
     lines.append("        'rate_limit_per_minute': RATE_LIMIT_PER_MINUTE or None,")
@@ -1567,12 +1599,32 @@ def generate_fastapi_code(
     lines.append("        # notebook function is awaited directly instead, exactly")
     lines.append("        # as before -- it already cooperates with the event loop")
     lines.append("        # on its own and has no need for a worker thread.")
-    lines.append("        if inspect.iscoroutinefunction(func):")
-    lines.append("            result = await func(*args, **kwargs)")
-    lines.append("        else:")
-    lines.append("            result = await anyio.to_thread.run_sync(")
-    lines.append("                functools.partial(func, *args, **kwargs)")
-    lines.append("            )")
+    lines.append("        # anyio.fail_after(None) (TASK_EXECUTION_TIMEOUT_SECONDS'")
+    lines.append("        # own default, 0, is falsy -- `0 or None` is None) never")
+    lines.append("        # times out at all, preserving the previous unbounded-")
+    lines.append("        # execution-time behavior exactly. Given a real timeout,")
+    lines.append("        # it raises a plain TimeoutError (caught below) the moment")
+    lines.append("        # it elapses. abandon_on_cancel=True on the sync branch is")
+    lines.append("        # what actually makes that timeout meaningful there: a real")
+    lines.append("        # OS thread already running arbitrary notebook code can't be")
+    lines.append("        # forcibly killed, but without this, anyio's own default")
+    lines.append("        # (abandon_on_cancel=False) still *blocks this coroutine*")
+    lines.append("        # until that thread finishes on its own -- silently")
+    lines.append("        # defeating the timeout for the one case (a hung sync call)")
+    lines.append("        # it exists to catch. Abandoning it instead frees this")
+    lines.append("        # coroutine (and the capacity-limiter slot backing every")
+    lines.append("        # other endpoint's own threadpool use) immediately; the")
+    lines.append("        # orphaned thread itself still runs to completion")
+    lines.append("        # afterward, an unavoidable limit of cooperatively")
+    lines.append("        # cancelling arbitrary synchronous code at all.")
+    lines.append("        with anyio.fail_after(TASK_EXECUTION_TIMEOUT_SECONDS or None):")
+    lines.append("            if inspect.iscoroutinefunction(func):")
+    lines.append("                result = await func(*args, **kwargs)")
+    lines.append("            else:")
+    lines.append("                result = await anyio.to_thread.run_sync(")
+    lines.append("                    functools.partial(func, *args, **kwargs),")
+    lines.append("                    abandon_on_cancel=True,")
+    lines.append("                )")
     lines.append("        # jsonable_encoder both validates that `result` is")
     lines.append("        # actually something GET /tasks/{task_id} -- and GET")
     lines.append("        # /tasks, which returns *every* task in one response --")
@@ -1612,6 +1664,28 @@ def generate_fastapi_code(
     lines.append(
         "                _deliver_task_webhook, callback_url, "
         "{\"task_id\": task_id, \"status\": \"completed\", \"result\": result}"
+    )
+    lines.append("            )")
+    # A separate except clause from the generic Exception one below,
+    # rather than letting it fall through to that one's own str(e) --
+    # anyio.fail_after's own TimeoutError carries no message at all
+    # (str(e) is just ""), which would otherwise record a completely
+    # uninformative empty "error", indistinguishable from any other
+    # unlabeled failure.
+    lines.append("    except TimeoutError:")
+    lines.append(
+        "        timeout_error = ("
+        "f'Task exceeded its {TASK_EXECUTION_TIMEOUT_SECONDS}s '"
+        "'execution timeout')"
+    )
+    lines.append("        if task_id in TASKS:")
+    lines.append("            TASKS[task_id][\"status\"] = \"failed\"")
+    lines.append("            TASKS[task_id][\"error\"] = timeout_error")
+    lines.append("        if callback_url:")
+    lines.append("            await anyio.to_thread.run_sync(")
+    lines.append(
+        "                _deliver_task_webhook, callback_url, "
+        "{\"task_id\": task_id, \"status\": \"failed\", \"error\": timeout_error}"
     )
     lines.append("            )")
     lines.append("    except Exception as e:")
