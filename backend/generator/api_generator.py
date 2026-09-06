@@ -69,6 +69,7 @@ RESERVED_INFRASTRUCTURE_NAMES = frozenset({
     "verify_api_key", "custom_openapi",
     "root", "health_check", "readiness_check", "auth_status", "auth_info",
     "validate_auth", "service_info", "service_config", "metrics", "uptime",
+    "metrics_prometheus", "_task_status_counts",
     "get_task", "list_tasks", "delete_task", "cleanup_tasks",
     "delete_completed_tasks", "delete_failed_tasks", "reset_tasks",
     "notebook_module",
@@ -1540,9 +1541,13 @@ def generate_fastapi_code(
     lines.append("    }")
 
     lines.append("")
-    lines.append("@app.get('/metrics')")
-    lines.append("def metrics():")
-
+    # Shared by GET /metrics and GET /metrics/prometheus below, so the two
+    # can never report different counts for the exact same underlying
+    # TASKS state -- before this existed, /metrics computed this inline,
+    # and a second endpoint reporting the identical breakdown in a
+    # different format would otherwise have had to duplicate (and could
+    # drift from) the exact same three sum()s.
+    lines.append("def _task_status_counts():")
     lines.append("    processing = sum(")
     lines.append("        1")
     lines.append("        for task in TASKS.values()")
@@ -1561,12 +1566,91 @@ def generate_fastapi_code(
     lines.append("        if task.get('status') == 'failed'")
     lines.append("    )")
 
+    lines.append("    return processing, completed, failed")
+
+    lines.append("")
+    lines.append("@app.get('/metrics')")
+    lines.append("def metrics():")
+
+    lines.append("    processing, completed, failed = _task_status_counts()")
+
     lines.append("    return {")
     lines.append("        'total_tasks': len(TASKS),")
     lines.append("        'processing': processing,")
     lines.append("        'completed': completed,")
     lines.append("        'failed': failed")
     lines.append("    }")
+
+    # GET /metrics above has served this dashboard-shaped JSON summary
+    # since before this endpoint existed -- changing its own response
+    # shape now would break any existing consumer already parsing it.
+    # But it's exactly the wrong shape for the far more common real
+    # consumer of a "/metrics" path by convention: Prometheus (and
+    # anything speaking its own text exposition format -- Grafana Agent,
+    # VictoriaMetrics, ...) expects "# HELP"/"# TYPE" comments followed by
+    # "metric_name value" lines, not a JSON object, and has no way to
+    # scrape this app's own task counts without a separate translation
+    # sidecar in between. A new, purely additive path -- not a query
+    # param or Accept-header branch on GET /metrics itself, which would
+    # risk a real scraper's request somehow landing on the JSON branch
+    # instead -- lets a real Prometheus config point "metrics_path" here
+    # with a one-line scrape-config change, no sidecar required, while
+    # leaving GET /metrics itself completely unchanged for whatever
+    # already depends on its JSON shape today.
+    #
+    # No Depends(verify_api_key), matching GET /metrics/GET /health
+    # above: a Prometheus scrape target is configured with a fixed URL a
+    # scraper hits unattended on a timer, and Prometheus's own scrape
+    # config supports only a handful of fixed auth schemes (basic auth, a
+    # bearer token) -- not this app's own X-API-Key header -- so requiring
+    # it here would make this endpoint unreachable from a real Prometheus
+    # instance's default configuration.
+    lines.append("")
+    lines.append("@app.get('/metrics/prometheus')")
+    lines.append("def metrics_prometheus():")
+    lines.append("    processing, completed, failed = _task_status_counts()")
+    lines.append("    uptime_seconds = time.time() - START_TIME")
+    lines.append("    body = (")
+    lines.append(
+        "        '# HELP notebook_api_tasks_total Total number of "
+        "background tasks currently tracked, across every status.\\n'"
+    )
+    lines.append("        '# TYPE notebook_api_tasks_total gauge\\n'")
+    lines.append("        f'notebook_api_tasks_total {len(TASKS)}\\n'")
+    lines.append(
+        "        '# HELP notebook_api_tasks_processing Number of "
+        "background tasks currently processing.\\n'"
+    )
+    lines.append("        '# TYPE notebook_api_tasks_processing gauge\\n'")
+    lines.append("        f'notebook_api_tasks_processing {processing}\\n'")
+    lines.append(
+        "        '# HELP notebook_api_tasks_completed Number of "
+        "background tasks that completed successfully.\\n'"
+    )
+    lines.append("        '# TYPE notebook_api_tasks_completed gauge\\n'")
+    lines.append("        f'notebook_api_tasks_completed {completed}\\n'")
+    lines.append(
+        "        '# HELP notebook_api_tasks_failed Number of background "
+        "tasks that failed.\\n'"
+    )
+    lines.append("        '# TYPE notebook_api_tasks_failed gauge\\n'")
+    lines.append("        f'notebook_api_tasks_failed {failed}\\n'")
+    lines.append(
+        "        '# HELP notebook_api_uptime_seconds Seconds since this "
+        "process started.\\n'"
+    )
+    lines.append("        '# TYPE notebook_api_uptime_seconds counter\\n'")
+    lines.append("        f'notebook_api_uptime_seconds {uptime_seconds}\\n'")
+    lines.append("    )")
+    # The Prometheus text exposition format's own registered media type --
+    # not "text/plain" alone, which a real Prometheus scraper (and
+    # promtool's own format validator) does not recognize as this format
+    # at all.
+    lines.append(
+        "    return Response("
+        "content=body, media_type='text/plain; version=0.0.4; "
+        "charset=utf-8')"
+    )
 
     lines.append("")
     lines.append("@app.get('/uptime')")

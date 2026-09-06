@@ -525,6 +525,156 @@ def test_generated_app_exposes_get_config_reporting_its_own_runtime_limits(monke
     assert body["public_url"] == "http://localhost:8000"
 
 
+def test_generated_app_exposes_get_metrics_as_json(monkeypatch):
+
+    functions = [{"name": "train_model", "args": [], "return_type": "dict"}]
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["notebook_module"].train_model = lambda: "done"
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    client.post("/train_model", json={}, headers=headers)
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "total_tasks": 1, "processing": 0, "completed": 1, "failed": 0,
+    }
+
+
+def test_generated_app_exposes_get_metrics_prometheus(monkeypatch):
+    """Confirmed missing before this feature: GET /metrics already
+    reported this app's own task counts, but only as a JSON object --
+    exactly the wrong shape for the far more common real consumer of a
+    "/metrics" path by convention (Prometheus, and anything speaking its
+    own text exposition format), which has no way to scrape this app's
+    own task counts without a separate translation sidecar in between.
+    """
+
+    functions = [{"name": "train_model", "args": [], "return_type": "dict"}]
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["notebook_module"].train_model = lambda: "done"
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    client.post("/train_model", json={}, headers=headers)
+
+    resp = client.get("/metrics/prometheus")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
+
+    body = resp.text
+    assert "# HELP notebook_api_tasks_total" in body
+    assert "# TYPE notebook_api_tasks_total gauge" in body
+    assert "notebook_api_tasks_total 1" in body
+    assert "notebook_api_tasks_processing 0" in body
+    assert "notebook_api_tasks_completed 1" in body
+    assert "notebook_api_tasks_failed 0" in body
+    assert "# TYPE notebook_api_uptime_seconds counter" in body
+    assert "notebook_api_uptime_seconds " in body
+
+
+def test_generated_app_metrics_prometheus_requires_no_api_key(monkeypatch):
+    """A Prometheus scrape target is hit unattended on a timer by a
+    scraper whose own config supports only a handful of fixed auth
+    schemes -- not this app's own X-API-Key header -- so requiring one
+    here would make this endpoint unreachable from a real Prometheus
+    instance's default configuration, the same reasoning GET
+    /metrics/GET /health already have no Depends(verify_api_key) either.
+    """
+
+    functions = [{"name": "add", "args": [], "return_type": "int"}]
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["notebook_module"].add = lambda a, b: a + b
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+
+    resp = client.get("/metrics/prometheus")
+
+    assert resp.status_code == 200
+
+
+def test_generated_app_metrics_prometheus_reflects_a_failed_task(monkeypatch):
+
+    functions = [{"name": "train_model", "args": [], "return_type": "dict"}]
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+
+    def _blows_up():
+        raise ValueError("boom")
+
+    namespace["notebook_module"].train_model = _blows_up
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    client.post("/train_model", json={}, headers=headers)
+
+    resp = client.get("/metrics/prometheus")
+
+    assert resp.status_code == 200
+    assert "notebook_api_tasks_failed 1" in resp.text
+    assert "notebook_api_tasks_completed 0" in resp.text
+
+
+def test_notebook_function_named_metrics_prometheus_is_rejected():
+    """metrics_prometheus is a reserved infrastructure name (GET
+    /metrics/prometheus) -- same collision hazard class as
+    service_info/metrics/uptime.
+    """
+
+    functions = [
+        {"name": "metrics_prometheus", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="metrics_prometheus"):
+        generate_fastapi_code(functions)
+
+
+def test_notebook_function_named_task_status_counts_is_rejected():
+    """_task_status_counts is a module-level helper both GET /metrics and
+    GET /metrics/prometheus call by name -- same collision hazard class
+    as _evict_expired_tasks/_run_background_task: a notebook function of
+    this exact name would silently overwrite it, breaking both endpoints
+    at once.
+    """
+
+    functions = [
+        {"name": "_task_status_counts", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="_task_status_counts"):
+        generate_fastapi_code(functions)
+
+
 def test_notebook_function_named_service_config_is_rejected():
     """service_config is a reserved infrastructure name (GET /config) --
     same collision hazard class as service_info/metrics/uptime.
