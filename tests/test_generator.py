@@ -588,6 +588,88 @@ def test_notebook_function_named_run_background_task_is_rejected():
         generate_fastapi_code(functions)
 
 
+def test_notebook_function_named_task_ttl_seconds_is_rejected():
+    """TASK_TTL_SECONDS is read by name from inside _evict_expired_tasks'
+    own body -- same collision hazard class as _evict_expired_tasks/
+    _run_background_task themselves, just for a constant one of them
+    reads rather than the helper itself.
+    """
+
+    functions = [
+        {"name": "TASK_TTL_SECONDS", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="TASK_TTL_SECONDS"):
+        generate_fastapi_code(functions)
+
+
+def test_notebook_function_named_source_notebook_sha256_is_rejected():
+    """SOURCE_NOTEBOOK_SHA256 is assigned this compile's own real content
+    hash once, at module load, then read back verbatim by GET /info --
+    same collision hazard class as every other module-level constant
+    here.
+    """
+
+    functions = [
+        {"name": "SOURCE_NOTEBOOK_SHA256", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="SOURCE_NOTEBOOK_SHA256"):
+        generate_fastapi_code(functions)
+
+
+def test_notebook_function_named_enforce_rate_limit_is_rejected():
+    """_enforce_rate_limit is a module-level helper verify_api_key's own
+    body calls by name on every single request (via Depends(verify_api_key)
+    on literally every endpoint) -- same collision hazard class as
+    _evict_expired_tasks/_run_background_task, just for the rate-limiting
+    subsystem instead of the background-task one.
+    """
+
+    functions = [
+        {"name": "_enforce_rate_limit", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="_enforce_rate_limit"):
+        generate_fastapi_code(functions)
+
+
+def test_notebook_function_named_rate_limit_per_minute_is_rejected():
+    """RATE_LIMIT_PER_MINUTE is read by name from inside
+    _enforce_rate_limit's own body -- one level removed from
+    _enforce_rate_limit's own name, but the identical exposure: every
+    endpoint's own Depends(verify_api_key) calls _enforce_rate_limit,
+    which reads this constant.
+    """
+
+    functions = [
+        {"name": "RATE_LIMIT_PER_MINUTE", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="RATE_LIMIT_PER_MINUTE"):
+        generate_fastapi_code(functions)
+
+
+def test_notebook_function_named_rate_limit_window_seconds_is_rejected():
+
+    functions = [
+        {"name": "RATE_LIMIT_WINDOW_SECONDS", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="RATE_LIMIT_WINDOW_SECONDS"):
+        generate_fastapi_code(functions)
+
+
+def test_notebook_function_named_rate_limit_windows_is_rejected():
+
+    functions = [
+        {"name": "_RATE_LIMIT_WINDOWS", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="_RATE_LIMIT_WINDOWS"):
+        generate_fastapi_code(functions)
+
+
 def test_background_endpoint_rejects_new_tasks_past_max_pending_tasks():
     """_evict_expired_tasks bounds TASKS' long-term growth, but a burst of
     background requests arriving faster than TASK_TTL_SECONDS still grew

@@ -19,7 +19,53 @@ RESERVED_INFRASTRUCTURE_NAMES = frozenset({
     "MAX_REQUEST_BODY_BYTES", "MaxRequestBodySizeMiddleware",
     "MAX_PENDING_TASKS", "WEBHOOK_TIMEOUT_SECONDS", "WEBHOOK_SECRET",
     "TASK_EXECUTION_TIMEOUT_SECONDS",
+    # Read by name from inside _evict_expired_tasks' own body -- the
+    # identical "referenced by name inside a helper every background
+    # endpoint's own submission calls first" exposure already documented
+    # below for _evict_expired_tasks/_run_background_task themselves,
+    # just for a constant this one reads rather than the helper itself.
+    # A notebook function named "TASK_TTL_SECONDS" would silently disable
+    # every background task's own eviction from TASKS entirely (the
+    # shadowing function is never called by anything, so the comparison
+    # against it -- now a function object, not a number -- raises inside
+    # _evict_expired_tasks on its very next invocation).
+    "TASK_TTL_SECONDS",
+    # Assigned this compile's own real content hash once, at module load
+    # (see write_generated_api's own caller), then read back verbatim by
+    # GET /info below -- a notebook function of this exact name would
+    # silently replace that string with a function object instead,
+    # confirmed to make GET /info's own "source_notebook_sha256" field
+    # come back as "{}" (jsonable_encoder's fallback for an otherwise-
+    # unserializable object) rather than the notebook's real hash, with
+    # no error anywhere to indicate the field is now meaningless.
+    "SOURCE_NOTEBOOK_SHA256",
     "_deliver_task_webhook",
+    # Confirmed exploitable, the identical class of bug
+    # _evict_expired_tasks/_run_background_task below already guard
+    # against, just never itself caught for the rate-limiting subsystem:
+    # every one of these is referenced by name *inside* verify_api_key's
+    # own body (verify_api_key calls _enforce_rate_limit(x_api_key,
+    # response), which in turn reads RATE_LIMIT_PER_MINUTE/
+    # RATE_LIMIT_WINDOW_SECONDS/_RATE_LIMIT_WINDOWS), resolved at *call*
+    # time, not def time -- and verify_api_key runs via
+    # Depends(verify_api_key) on literally every endpoint this app
+    # exposes. Reproduced: a notebook exposing `_enforce_rate_limit(x:
+    # int) -> int` alongside an unrelated `add` compiled fine and
+    # silently overwrote the real rate limiter at module-execution time;
+    # with NOTEBOOK_API_RATE_LIMIT_PER_MINUTE set, every single request
+    # to `/add` -- an endpoint with nothing to do with the colliding
+    # name's own logic -- then failed with a bare 500, since
+    # verify_api_key's own call site still passes the real helper's
+    # (api_key, response) signature into what is now the notebook's own,
+    # incompatible one. The other three names in this same group
+    # (RATE_LIMIT_PER_MINUTE/RATE_LIMIT_WINDOW_SECONDS/
+    # _RATE_LIMIT_WINDOWS) are each read the identical way from inside
+    # that same now-shadowable helper -- the same "one bad name breaks a
+    # subsystem every endpoint depends on" exposure, just one level
+    # removed from _enforce_rate_limit's own name instead of the call
+    # site.
+    "_enforce_rate_limit", "RATE_LIMIT_PER_MINUTE", "RATE_LIMIT_WINDOW_SECONDS",
+    "_RATE_LIMIT_WINDOWS",
     "verify_api_key", "custom_openapi",
     "root", "health_check", "readiness_check", "auth_status", "auth_info",
     "validate_auth", "service_info", "service_config", "metrics", "uptime",
