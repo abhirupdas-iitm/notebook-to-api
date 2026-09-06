@@ -2102,6 +2102,145 @@ def test_export_curl_command_rejects_only_and_exclude_together(tmp_path):
     _assert_clean_cli_error(proc, "only and exclude can't both be given")
 
 
+def test_export_postman_command_is_registered():
+
+    proc = _run_cli(["--help"], cwd=Path.cwd())
+
+    assert proc.returncode == 0
+    assert "export-postman" in proc.stdout
+
+
+def test_export_postman_command_writes_a_collection_with_an_item_per_function(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook_with_function(
+        notebook_path,
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n",
+    )
+
+    proc = _run_cli(["export-postman", str(notebook_path)], cwd=workdir)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (
+        "Postman collection written to: postman_collection.json (2 request(s))"
+        in proc.stdout
+    )
+
+    collection = json.loads(
+        (workdir / "postman_collection.json").read_text(encoding="utf-8")
+    )
+    assert [item["name"] for item in collection["item"]] == ["add", "subtract"]
+    assert collection["info"]["name"] == "nb"
+
+
+def test_export_postman_command_respects_host_port_api_key_name_and_output(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook_with_function(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    proc = _run_cli(
+        [
+            "export-postman", str(notebook_path),
+            "--host", "api.example.com", "--port", "9000",
+            "--api-key", "mykey123", "--collection-name", "My API",
+            "--output", "custom.json",
+        ],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    collection = json.loads((workdir / "custom.json").read_text(encoding="utf-8"))
+    assert collection["info"]["name"] == "My API"
+    variables = {v["key"]: v["value"] for v in collection["variable"]}
+    assert variables["base_url"] == "http://api.example.com:9000"
+    assert variables["api_key"] == "mykey123"
+    assert not (workdir / "postman_collection.json").exists()
+
+
+def test_export_postman_command_json_flag_emits_machine_readable_output(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook_with_function(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    proc = _run_cli(
+        ["export-postman", str(notebook_path), "--json"], cwd=workdir
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    data = json.loads(proc.stdout)
+
+    assert data["status"] == "success"
+    assert data["path"] == "postman_collection.json"
+    assert [item["name"] for item in data["collection"]["item"]] == ["add"]
+
+
+def test_export_postman_command_reports_a_clean_error_for_a_missing_notebook(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["export-postman", str(workdir / "does-not-exist.ipynb")], cwd=workdir
+    )
+
+    _assert_clean_cli_error(proc, "No such file or directory")
+
+
+def test_export_postman_command_only_restricts_to_the_named_functions(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook_with_function(
+        notebook_path,
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n",
+    )
+
+    proc = _run_cli(
+        ["export-postman", str(notebook_path), "--only", "add"], cwd=workdir
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "(1 request(s))" in proc.stdout
+
+    collection = json.loads(
+        (workdir / "postman_collection.json").read_text(encoding="utf-8")
+    )
+    assert [item["name"] for item in collection["item"]] == ["add"]
+
+
+def test_export_postman_command_rejects_only_and_exclude_together(tmp_path):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    notebook_path = workdir / "nb.ipynb"
+    _write_notebook_with_function(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    proc = _run_cli(
+        [
+            "export-postman", str(notebook_path),
+            "--only", "add", "--exclude", "add",
+        ],
+        cwd=workdir,
+    )
+
+    _assert_clean_cli_error(proc, "only and exclude can't both be given")
+
+
 def test_remote_curl_command_only_restricts_to_the_named_functions(
     tmp_path, fake_dashboard
 ):
@@ -11751,6 +11890,210 @@ def test_curl_preview_command_reports_a_clean_error_when_the_dashboard_is_unreac
     proc = _run_cli(
         [
             "curl-preview", "nb.ipynb",
+            "--dashboard-url", "http://127.0.0.1:1", "--timeout", "5",
+        ],
+        cwd=workdir,
+    )
+
+    _assert_clean_cli_error(proc, "Is it running?")
+
+
+def test_postman_preview_command_is_registered():
+
+    proc = _run_cli(["--help"], cwd=Path.cwd())
+
+    assert proc.returncode == 0
+    assert "postman-preview" in proc.stdout
+
+
+def test_postman_preview_command_lists_the_request_names(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success",
+            "notebook": "nb.ipynb",
+            "collection": {
+                "info": {"name": "nb"},
+                "variable": [],
+                "item": [{"name": "add"}, {"name": "subtract"}],
+            },
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["postman-preview", "nb.ipynb", "--dashboard-url", dashboard_url],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "- add" in proc.stdout
+    assert "- subtract" in proc.stdout
+    assert "2 request(s) total" in proc.stdout
+    assert handler.requests == ["/api/postman-preview"]
+    assert json.loads(handler.bodies[0]) == {
+        "notebook_path": "nb.ipynb",
+        "host": "localhost",
+        "port": 8000,
+        "api_key": "notebook-to-api-dev-key",
+        "only": None,
+        "exclude": None,
+        "collection_name": None,
+    }
+
+
+def test_postman_preview_command_passes_host_port_api_key_and_name_through(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success", "notebook": "nb.ipynb",
+            "collection": {"info": {"name": "My API"}, "variable": [], "item": []},
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "postman-preview", "nb.ipynb", "--dashboard-url", dashboard_url,
+            "--host", "api.example.com", "--port", "9000", "--api-key", "mykey123",
+            "--collection-name", "My API",
+        ],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(handler.bodies[0]) == {
+        "notebook_path": "nb.ipynb",
+        "host": "api.example.com",
+        "port": 9000,
+        "api_key": "mykey123",
+        "only": None,
+        "exclude": None,
+        "collection_name": "My API",
+    }
+
+
+def test_postman_preview_command_passes_only_exclude_and_version_id_through(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success", "notebook": "nb.ipynb", "version_id": "v1.ipynb",
+            "collection": {"info": {"name": "nb"}, "variable": [], "item": []},
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "postman-preview", "nb.ipynb",
+            "--dashboard-url", dashboard_url, "--version-id", "v1.ipynb",
+            "--only", "add",
+        ],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "'nb.ipynb' version 'v1.ipynb'" in proc.stdout
+    assert json.loads(handler.bodies[0]) == {
+        "notebook_path": "nb.ipynb",
+        "host": "localhost",
+        "port": 8000,
+        "api_key": "notebook-to-api-dev-key",
+        "only": ["add"],
+        "exclude": None,
+        "collection_name": None,
+        "version_id": "v1.ipynb",
+    }
+
+
+def test_postman_preview_command_reports_no_endpoints(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success", "notebook": "nb.ipynb",
+            "collection": {"info": {"name": "nb"}, "variable": [], "item": []},
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["postman-preview", "nb.ipynb", "--dashboard-url", dashboard_url],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "No endpoints would be generated" in proc.stdout
+
+
+def test_postman_preview_command_json_flag_emits_the_dashboards_own_response(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    body = {
+        "status": "success", "notebook": "nb.ipynb",
+        "collection": {"info": {"name": "nb"}, "variable": [], "item": [{"name": "add"}]},
+    }
+    handler.responses = [_json_response(200, body)]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["postman-preview", "nb.ipynb", "--dashboard-url", dashboard_url, "--json"],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout) == body
+
+
+def test_postman_preview_command_reports_a_clean_error_for_a_missing_notebook(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(404, {"detail": "Notebook file not found"})
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["postman-preview", "nb.ipynb", "--dashboard-url", dashboard_url],
+        cwd=workdir,
+    )
+
+    _assert_clean_cli_error(proc, "Notebook file not found")
+
+
+def test_postman_preview_command_reports_a_clean_error_when_the_dashboard_is_unreachable(
+    tmp_path,
+):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "postman-preview", "nb.ipynb",
             "--dashboard-url", "http://127.0.0.1:1", "--timeout", "5",
         ],
         cwd=workdir,

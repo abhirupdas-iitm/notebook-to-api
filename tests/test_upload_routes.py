@@ -18773,6 +18773,272 @@ def test_curl_preview_rejects_a_non_integer_port():
     assert resp.status_code == 400
 
 
+def test_postman_preview_returns_one_item_per_function():
+
+    content = _notebook_bytes(
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n"
+    )
+
+    upload_resp = client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "postman_preview_basic.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+    assert upload_resp.status_code == 200
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={"notebook_path": "postman_preview_basic.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    assert body["notebook"] == "postman_preview_basic.ipynb"
+    collection = body["collection"]
+    assert [item["name"] for item in collection["item"]] == ["add", "subtract"]
+    assert collection["info"]["name"] == "postman_preview_basic"
+
+
+def test_postman_preview_respects_custom_host_port_api_key_and_collection_name():
+
+    content = _notebook_bytes(
+        "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    upload_resp = client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "postman_preview_custom.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+    assert upload_resp.status_code == 200
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={
+            "notebook_path": "postman_preview_custom.ipynb",
+            "host": "api.example.com",
+            "port": 9000,
+            "api_key": "mykey123",
+            "collection_name": "My API",
+        },
+    )
+
+    assert resp.status_code == 200
+    collection = resp.json()["collection"]
+    assert collection["info"]["name"] == "My API"
+    variables = {v["key"]: v["value"] for v in collection["variable"]}
+    assert variables["base_url"] == "http://api.example.com:9000"
+    assert variables["api_key"] == "mykey123"
+
+
+def test_postman_preview_adds_a_task_status_item_for_a_background_function():
+
+    content = _notebook_bytes(
+        "def train_model(epochs: int) -> str:\n    return 'done'\n"
+    )
+
+    client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "postman_preview_background.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={"notebook_path": "postman_preview_background.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    items = resp.json()["collection"]["item"]
+    assert [item["name"] for item in items] == [
+        "train_model", "train_model - Task Status",
+    ]
+
+
+def test_postman_preview_excludes_a_reserved_name_conflict():
+
+    content = _notebook_bytes("def health_check() -> dict:\n    return {}\n")
+
+    client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "postman_preview_reserved.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={"notebook_path": "postman_preview_reserved.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["collection"]["item"] == []
+
+
+def test_postman_preview_only_restricts_to_the_named_functions():
+
+    content = _notebook_bytes(
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n"
+    )
+
+    client.post(
+        "/api/upload",
+        files={"file": ("postman_preview_only.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={"notebook_path": "postman_preview_only.ipynb", "only": ["add"]},
+    )
+
+    assert resp.status_code == 200
+    items = resp.json()["collection"]["item"]
+    assert [item["name"] for item in items] == ["add"]
+
+
+def test_postman_preview_rejects_only_and_exclude_together():
+
+    content = _notebook_bytes("def add(a: int, b: int) -> int:\n    return a + b\n")
+
+    client.post(
+        "/api/upload",
+        files={"file": ("postman_preview_both.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={
+            "notebook_path": "postman_preview_both.ipynb",
+            "only": ["add"], "exclude": ["add"],
+        },
+    )
+
+    assert resp.status_code == 400
+
+
+def test_postman_preview_rejects_an_unknown_only_name():
+
+    content = _notebook_bytes("def add(a: int, b: int) -> int:\n    return a + b\n")
+
+    client.post(
+        "/api/upload",
+        files={"file": ("postman_preview_unknown.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={"notebook_path": "postman_preview_unknown.ipynb", "only": ["does_not_exist"]},
+    )
+
+    assert resp.status_code == 400
+
+
+def test_postman_preview_rejects_a_non_string_collection_name():
+
+    _upload_sample_notebook("postman_preview_bad_name.ipynb")
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={
+            "notebook_path": "postman_preview_bad_name.ipynb",
+            "collection_name": 123,
+        },
+    )
+
+    assert resp.status_code == 400
+
+
+def test_postman_preview_does_not_touch_generated_dir(monkeypatch, tmp_path):
+
+    content = _notebook_bytes("def add(a: int, b: int) -> int:\n    return a + b\n")
+
+    upload_resp = client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "postman_preview_no_side_effects.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+    assert upload_resp.status_code == 200
+
+    generated_dir = tmp_path / "postman_preview_generated"
+    monkeypatch.setattr("backend.routes.upload.GENERATED_DIR", str(generated_dir))
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={"notebook_path": "postman_preview_no_side_effects.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    assert not generated_dir.exists()
+
+
+def test_postman_preview_returns_404_for_a_missing_notebook():
+
+    resp = client.post(
+        "/api/postman-preview", json={"notebook_path": "does_not_exist.ipynb"}
+    )
+
+    assert resp.status_code == 404
+
+
+def test_postman_preview_returns_400_for_a_malformed_notebook_file():
+
+    filename = "postman_preview_malformed.ipynb"
+    file_path = os.path.join(UPLOAD_DIR, filename)
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("not valid json at all")
+
+    resp = client.post("/api/postman-preview", json={"notebook_path": filename})
+
+    assert resp.status_code == 400
+
+
+def test_postman_preview_requires_a_notebook_path():
+
+    resp = client.post("/api/postman-preview", json={})
+
+    assert resp.status_code == 400
+
+
+def test_postman_preview_rejects_a_non_integer_port():
+
+    _upload_sample_notebook("postman_preview_bad_port.ipynb")
+
+    resp = client.post(
+        "/api/postman-preview",
+        json={"notebook_path": "postman_preview_bad_port.ipynb", "port": "not-a-number"},
+    )
+
+    assert resp.status_code == 400
+
+
 def test_curl_preview_with_version_id_previews_that_snapshots_commands():
 
     filename = "curl_preview_version_id.ipynb"

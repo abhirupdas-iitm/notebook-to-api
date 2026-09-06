@@ -69,6 +69,7 @@ from backend.inspector import (
     diff_notebook_functions,
     diff_notebook_source,
     generate_curl_commands,
+    generate_postman_collection,
     inspect_notebook_data,
     list_generated_files,
 )
@@ -10710,6 +10711,131 @@ def curl_preview_endpoint(data: dict):
         "notebook": notebook_path,
         "version_id": version_id,
         "commands": commands,
+    }
+
+
+@router.post("/postman-preview")
+def postman_preview_endpoint(data: dict):
+    """A Postman Collection v2.1.0 for every function an already-uploaded
+    notebook would compile into an endpoint -- the same "no compile step,
+    no local temp file" preview POST /api/curl-preview already gives a
+    caller reaching for curl, for a caller reaching for Postman instead.
+    Body fields, validation, and behavior otherwise mirror that endpoint
+    exactly (see its own docstring above); the only difference is which
+    generator this calls -- generate_postman_collection (backend/
+    inspector.py) instead of generate_curl_commands -- and what it
+    returns.
+
+    "collection_name" (optional) becomes the returned collection's own
+    "info.name" -- omitted, generate_postman_collection falls back to
+    "notebook_path"'s own filename stem, the same default it already
+    applies for any other caller (e.g. `export-postman`) that doesn't
+    supply one either.
+
+    Returns the generated collection under "collection", a plain JSON
+    object a caller can hand straight to Postman's own "Import" dialog,
+    or write to a `.postman_collection.json` file itself -- this endpoint
+    writes nothing to disk on either side.
+    """
+
+    notebook_path = data.get("notebook_path")
+
+    if not notebook_path:
+
+        raise HTTPException(
+            status_code=400,
+            detail="notebook_path is required"
+        )
+
+    version_id = data.get("version_id")
+    only = data.get("only")
+    exclude = data.get("exclude")
+
+    for field_name, field_value in (("only", only), ("exclude", exclude)):
+
+        if field_value is not None and (
+            not isinstance(field_value, list)
+            or not all(isinstance(item, str) for item in field_value)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a list of strings"
+            )
+
+    if only and exclude:
+
+        raise HTTPException(
+            status_code=400,
+            detail="only and exclude can't both be given -- choose one."
+        )
+
+    full_path = _resolve_preview_content_path(notebook_path, version_id)
+
+    try:
+
+        load_notebook(str(full_path))
+
+    except MALFORMED_NOTEBOOK_ERRORS as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Uploaded file is not a valid Jupyter notebook: {e}"
+        )
+
+    host = data.get("host", "localhost")
+    port = data.get("port", 8000)
+    api_key = data.get("api_key")
+    collection_name = data.get("collection_name")
+
+    if not isinstance(host, str):
+
+        raise HTTPException(
+            status_code=400,
+            detail="host must be a string"
+        )
+
+    if not isinstance(port, int) or isinstance(port, bool):
+
+        raise HTTPException(
+            status_code=400,
+            detail="port must be an integer"
+        )
+
+    if api_key is not None and not isinstance(api_key, str):
+
+        raise HTTPException(
+            status_code=400,
+            detail="api_key must be a string"
+        )
+
+    if collection_name is not None and not isinstance(collection_name, str):
+
+        raise HTTPException(
+            status_code=400,
+            detail="collection_name must be a string"
+        )
+
+    try:
+
+        with COMPILE_LOCK:
+
+            collection = generate_postman_collection(
+                str(full_path), host=host, port=port, api_key=api_key,
+                only=only, exclude=exclude, collection_name=collection_name,
+            )
+
+    except ValueError as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+
+    return {
+        "status": "success",
+        "notebook": notebook_path,
+        "version_id": version_id,
+        "collection": collection,
     }
 
 

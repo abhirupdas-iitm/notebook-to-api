@@ -28,6 +28,7 @@ from backend.inspector import (
     diff_notebook_functions,
     diff_notebook_source,
     generate_curl_commands,
+    generate_postman_collection,
     inspect_notebook,
     inspect_notebook_data,
     print_compile_summary,
@@ -344,7 +345,7 @@ from backend.observability.deployment_governance_delivery_worker_cli import (
 # commands through _dispatch_core_command's shared error handling.
 _CORE_COMMANDS = frozenset({
     "compile", "inspect", "validate", "export-openapi", "export-sdk",
-    "export-curl", "serve", "watch", "deploy", "diff", "upload", "import-notebooks", "import-url",
+    "export-curl", "export-postman", "serve", "watch", "deploy", "diff", "upload", "import-notebooks", "import-url",
     "list", "info", "info-batch",
     "search-functions", "search-content", "find-duplicates", "resolve-duplicates", "storage",
     "download", "export-notebooks", "delete", "delete-batch", "rename", "copy",
@@ -354,6 +355,7 @@ _CORE_COMMANDS = frozenset({
     "versions", "remote-files", "remote-diff", "diff-notebooks", "remote-export", "remote-deploy",
     "status", "remote-validate", "validate-all", "requirements-preview", "curl-preview",
     "remote-curl", "app-preview", "dockerfile-preview", "docker-compose-preview", "env-example-preview", "env-vars-preview",
+    "postman-preview",
 })
 
 # Exception types raised by real, expected failure conditions in the core
@@ -1252,6 +1254,30 @@ def _dispatch_core_command(args):
             ))
         else:
             print(f"\ncURL script written to: {output} ({len(commands)} request(s))")
+    elif args.command == "export-postman":
+        only = _parse_comma_separated_names(args.only)
+        exclude = _parse_comma_separated_names(args.exclude)
+        collection = generate_postman_collection(
+            args.notebook, host=args.host, port=args.port, api_key=args.api_key,
+            only=only, exclude=exclude, collection_name=args.collection_name,
+        )
+
+        output = args.output or "postman_collection.json"
+
+        with open(output, "w", encoding="utf-8") as f:
+            json.dump(collection, f, indent=2)
+            f.write("\n")
+
+        if args.json_output:
+            print(json.dumps(
+                {"status": "success", "path": output, "collection": collection},
+                indent=2,
+            ))
+        else:
+            print(
+                f"\nPostman collection written to: {output} "
+                f"({len(collection['item'])} request(s))"
+            )
     elif args.command == "serve":
         if args.debounce_seconds < 0:
             raise ValueError("--debounce must be zero or positive")
@@ -4079,6 +4105,68 @@ def _dispatch_core_command(args):
                 print("No endpoints would be generated for this notebook.")
             else:
                 print("\n\n".join(commands))
+    elif args.command == "postman-preview":
+        # See `upload` above for why this is imported here rather than at
+        # module scope.
+        import httpx
+
+        dashboard_url = args.dashboard_url.rstrip("/")
+
+        only = _parse_comma_separated_names(args.only)
+        exclude = _parse_comma_separated_names(args.exclude)
+
+        postman_preview_body = {
+            "notebook_path": args.filename,
+            "host": args.host,
+            "port": args.port,
+            "api_key": args.api_key,
+            "only": only,
+            "exclude": exclude,
+            "collection_name": args.collection_name,
+        }
+        if args.version_id:
+            postman_preview_body["version_id"] = args.version_id
+
+        try:
+            response = httpx.post(
+                f"{dashboard_url}/api/postman-preview",
+                json=postman_preview_body,
+                timeout=args.timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise _dashboard_connection_error(exc, dashboard_url)
+
+        if response.status_code >= 400:
+
+            raise RuntimeError(
+                f"Dashboard rejected the request ({response.status_code}): "
+                f"{_extract_dashboard_error_detail(response)}"
+            )
+
+        data = response.json()
+
+        if args.json_output:
+            print(json.dumps(data, indent=2))
+        else:
+
+            collection = data.get("collection", {})
+            items = collection.get("item", [])
+
+            target = (
+                f"'{args.filename}' version '{args.version_id}'" if args.version_id
+                else f"'{args.filename}'"
+            )
+            print(f"Postman collection preview for {target} on {dashboard_url}:\n")
+
+            if not items:
+                print("No endpoints would be generated for this notebook.")
+            else:
+                for item in items:
+                    print(f"- {item.get('name')}")
+                print(
+                    f"\n{len(items)} request(s) total. Pass --json to get "
+                    "the full collection document."
+                )
     elif args.command == "dockerfile-preview":
         # See `upload` above for why this is imported here rather than at
         # module scope.
@@ -6189,6 +6277,64 @@ def main():
             "Emit a machine-readable JSON result "
             "({\"status\", \"path\", \"commands\"}) instead of only "
             "writing the script file, for scripting/automation."
+        )
+    )
+
+    # export-postman command (generate a Postman Collection v2.1.0 for a
+    # notebook's would-be endpoints -- the same coverage export-curl
+    # already gives a terminal, for the far larger share of API consumers
+    # who reach for Postman instead of raw curl)
+    postman_parser = subparsers.add_parser(
+        "export-postman",
+        help="Generate a Postman Collection v2.1.0 for a notebook's would-be endpoints."
+    )
+    postman_parser.add_argument("notebook", help="Path to the notebook file.")
+    postman_parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host the generated requests target (default: localhost)."
+    )
+    postman_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port the generated requests target (default: 8000, matching `serve`'s own default)."
+    )
+    postman_parser.add_argument(
+        "--api-key",
+        default=DEFAULT_DEV_API_KEY,
+        dest="api_key",
+        help=(
+            "Value sent as the X-API-Key header, and as the collection's "
+            "own \"api_key\" variable (default: the generated app's own "
+            "default dev key, used when NOTEBOOK_API_KEY isn't set on the "
+            "server). Pass the same value configured via NOTEBOOK_API_KEY "
+            "if it's been changed."
+        )
+    )
+    postman_parser.add_argument(
+        "--collection-name",
+        default=None,
+        dest="collection_name",
+        help=(
+            "Name shown for the collection in Postman (default: the "
+            "notebook's own filename, without its extension)."
+        )
+    )
+    postman_parser.add_argument(
+        "--output",
+        default=None,
+        help="Path to write the generated collection to. Default: postman_collection.json"
+    )
+    _add_function_selection_arguments(postman_parser)
+    postman_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help=(
+            "Emit a machine-readable JSON result "
+            "({\"status\", \"path\", \"collection\"}) instead of only "
+            "writing the collection file, for scripting/automation."
         )
     )
 
@@ -8782,6 +8928,69 @@ def main():
         help=(
             "Emit the dashboard's own JSON response ({\"status\", "
             "\"notebook\", \"version_id\", \"commands\"}) instead of a "
+            "human-readable listing, for scripting/automation."
+        )
+    )
+
+    # postman-preview command (preview a Postman Collection v2.1.0 for a
+    # notebook already uploaded to a running dashboard instance, via its
+    # POST /api/postman-preview -- no download, no local file written,
+    # mirroring curl-preview above for Postman instead of curl)
+    postman_preview_parser = subparsers.add_parser(
+        "postman-preview",
+        help=(
+            "Preview a Postman Collection for a notebook already uploaded "
+            "to a running dashboard instance, via its POST "
+            "/api/postman-preview -- no download, no collection file "
+            "written."
+        )
+    )
+    postman_preview_parser.add_argument(
+        "filename",
+        help="Filename of the notebook already uploaded to the dashboard, as reported by `list`."
+    )
+    _add_dashboard_url_and_timeout_arguments(postman_preview_parser)
+    postman_preview_parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host the generated requests target (default: localhost)."
+    )
+    postman_preview_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port the generated requests target (default: 8000, matching `serve`'s own default)."
+    )
+    postman_preview_parser.add_argument(
+        "--api-key",
+        default=DEFAULT_DEV_API_KEY,
+        dest="api_key",
+        help=(
+            "Value sent as the X-API-Key header, and as the collection's "
+            "own \"api_key\" variable (default: the generated app's own "
+            "default dev key, used when NOTEBOOK_API_KEY isn't set on the "
+            "server). Pass the same value configured via NOTEBOOK_API_KEY "
+            "if it's been changed."
+        )
+    )
+    postman_preview_parser.add_argument(
+        "--collection-name",
+        default=None,
+        dest="collection_name",
+        help=(
+            "Name shown for the collection in Postman (default: the "
+            "notebook's own filename, without its extension)."
+        )
+    )
+    _add_function_selection_arguments(postman_preview_parser)
+    _add_version_id_argument(postman_preview_parser, "POST /api/postman-preview")
+    postman_preview_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help=(
+            "Emit the dashboard's own JSON response ({\"status\", "
+            "\"notebook\", \"version_id\", \"collection\"}) instead of a "
             "human-readable listing, for scripting/automation."
         )
     )

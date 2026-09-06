@@ -1138,3 +1138,161 @@ def generate_curl_commands(
         commands.append(command)
 
     return commands
+
+
+def generate_postman_collection(
+    notebook_path, host="localhost", port=8000, api_key=None,
+    only=None, exclude=None, collection_name=None,
+):
+    """A Postman Collection v2.1.0 covering every function `notebook_path`
+    would compile into an endpoint -- the same "try it before you compile
+    it" coverage generate_curl_commands above already gives a terminal,
+    for the far larger share of API consumers who reach for Postman
+    instead of raw curl and have no way to turn a curl command back into
+    a Postman request without pasting it into Postman's own "import from
+    curl" flow by hand, once per endpoint.
+
+    Mirrors generate_curl_commands wherever the two overlap: the same
+    reserved-name-conflict skipping (a notebook containing one fails to
+    compile at all, so a request targeting that path would never resolve
+    to anything real), the same only/exclude filtering -- including the
+    identical ValueError _filter_functions_by_name raises for both-given
+    or an unrecognized name -- the same example_payload-as-body, and the
+    same DEFAULT_DEV_API_KEY default. Works directly off
+    inspect_notebook_data, exactly like generate_curl_commands does, so
+    no compile step is required first.
+
+    "host"/"port"/"api_key" become the collection's own "base_url"/
+    "api_key" *variables* rather than being baked into each request's URL
+    and header directly, so a caller can retarget every request at once
+    (e.g. a different `serve` host/port, or a NOTEBOOK_API_KEY that's
+    since been rotated) from Postman's own variable editor, without
+    re-exporting the whole collection.
+
+    A background/task_id-based function (see _is_background_function
+    above) gets something a static curl command has no way to express at
+    all: its submission request carries a Postman "test" script that
+    captures the "task_id" field of its own response into a
+    "{name}_task_id" collection variable -- scoped per function, not one
+    shared "task_id", so running two different background functions'
+    requests in the same collection doesn't clobber one function's
+    captured id with another's -- and a paired "{name} - Task Status"
+    request is already wired to poll GET /tasks/{{"{name}_task_id"}} with
+    it, ready to send the moment the submission request has run once.
+    Every "{name}_task_id" variable is declared up front (default "") so
+    Postman doesn't warn about an undefined variable before that first
+    run. A synchronous function's own request gets neither the script nor
+    a companion request, since there's no task_id to capture.
+
+    Returns a plain dict -- a valid Postman Collection v2.1.0 document
+    once json.dump-ed -- rather than writing a file itself, the same
+    "return data, let the caller decide where it goes" split
+    inspect_notebook_data/generate_curl_commands already follow. Used by
+    both `export-postman` (writes it to a local file) and POST
+    /api/postman-preview (returns it directly as the response body).
+    """
+    if api_key is None:
+        api_key = DEFAULT_DEV_API_KEY
+
+    data = inspect_notebook_data(notebook_path)
+
+    functions = _filter_functions_by_name(data["functions"], only, exclude)
+
+    reserved_names = set(data["reserved_name_conflicts"])
+
+    base_url = f"http://{host}:{port}"
+
+    collection_variables = [
+        {"key": "base_url", "value": base_url},
+        {"key": "api_key", "value": api_key},
+    ]
+
+    items = []
+
+    for func in functions:
+
+        name = func["name"]
+
+        if name in reserved_names:
+            continue
+
+        payload = func.get("example_payload", {})
+
+        request = {
+            "method": "POST",
+            "header": [
+                {"key": "Content-Type", "value": "application/json"},
+                {"key": "X-API-Key", "value": "{{api_key}}"},
+            ],
+            "url": {
+                "raw": "{{base_url}}/" + name,
+                "host": ["{{base_url}}"],
+                "path": [name],
+            },
+            "body": {
+                "mode": "raw",
+                "raw": json.dumps(payload, indent=2),
+                "options": {"raw": {"language": "json"}},
+            },
+        }
+
+        item = {"name": name, "request": request}
+
+        if _is_background_function(name):
+
+            task_id_var = f"{name}_task_id"
+            collection_variables.append({"key": task_id_var, "value": ""})
+
+            request["description"] = (
+                'This POST only returns {"task_id": ...} immediately -- '
+                f'run the paired "{name} - Task Status" request below '
+                f"(its own {{{{{task_id_var}}}}} is captured automatically "
+                "from this response) to see the actual result."
+            )
+
+            item["event"] = [{
+                "listen": "test",
+                "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                        "if (pm.response.code === 200) {",
+                        "    const body = pm.response.json();",
+                        "    if (body.task_id) {",
+                        (
+                            f'        pm.collectionVariables.set('
+                            f'"{task_id_var}", body.task_id);'
+                        ),
+                        "    }",
+                        "}",
+                    ],
+                },
+            }]
+
+            items.append(item)
+            items.append({
+                "name": f"{name} - Task Status",
+                "request": {
+                    "method": "GET",
+                    "header": [{"key": "X-API-Key", "value": "{{api_key}}"}],
+                    "url": {
+                        "raw": "{{base_url}}/tasks/{{" + task_id_var + "}}",
+                        "host": ["{{base_url}}"],
+                        "path": ["tasks", "{{" + task_id_var + "}}"],
+                    },
+                },
+            })
+
+        else:
+            items.append(item)
+
+    return {
+        "info": {
+            "name": collection_name or Path(notebook_path).stem,
+            "schema": (
+                "https://schema.getpostman.com/json/collection/v2.1.0/"
+                "collection.json"
+            ),
+        },
+        "variable": collection_variables,
+        "item": items,
+    }

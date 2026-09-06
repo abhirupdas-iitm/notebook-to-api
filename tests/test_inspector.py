@@ -1,3 +1,5 @@
+import json
+
 import nbformat
 import pytest
 
@@ -7,6 +9,7 @@ from backend.inspector import (
     diff_notebook_functions,
     diff_notebook_source,
     generate_curl_commands,
+    generate_postman_collection,
     inspect_notebook,
     inspect_notebook_data,
     print_compile_summary,
@@ -1855,3 +1858,216 @@ def test_generate_curl_commands_rejects_an_unknown_only_name(tmp_path):
 
     with pytest.raises(ValueError):
         generate_curl_commands(str(notebook_path), only=["does_not_exist"])
+
+
+def test_generate_postman_collection_returns_one_item_per_function(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path,
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n",
+    )
+
+    collection = generate_postman_collection(str(notebook_path))
+
+    names = [item["name"] for item in collection["item"]]
+    assert names == ["add", "subtract"]
+
+
+def test_generate_postman_collection_uses_the_notebook_stem_as_the_default_name(tmp_path):
+
+    notebook_path = tmp_path / "my_notebook.ipynb"
+    _write_notebook(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    collection = generate_postman_collection(str(notebook_path))
+
+    assert collection["info"]["name"] == "my_notebook"
+    assert collection["info"]["schema"] == (
+        "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    )
+
+
+def test_generate_postman_collection_respects_a_custom_collection_name(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    collection = generate_postman_collection(
+        str(notebook_path), collection_name="My API"
+    )
+
+    assert collection["info"]["name"] == "My API"
+
+
+def test_generate_postman_collection_includes_the_example_payload_as_the_body(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    [item] = generate_postman_collection(str(notebook_path))["item"]
+
+    assert item["request"]["method"] == "POST"
+    assert item["request"]["url"]["raw"] == "{{base_url}}/add"
+    assert json.loads(item["request"]["body"]["raw"]) == {"a": 0, "b": 0}
+
+
+def test_generate_postman_collection_sets_base_url_and_api_key_variables(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    default_collection = generate_postman_collection(str(notebook_path))
+    variables = {v["key"]: v["value"] for v in default_collection["variable"]}
+    assert variables["base_url"] == "http://localhost:8000"
+    assert variables["api_key"] == DEFAULT_DEV_API_KEY
+
+    custom_collection = generate_postman_collection(
+        str(notebook_path), host="api.example.com", port=9000, api_key="mykey123"
+    )
+    variables = {v["key"]: v["value"] for v in custom_collection["variable"]}
+    assert variables["base_url"] == "http://api.example.com:9000"
+    assert variables["api_key"] == "mykey123"
+
+
+def test_generate_postman_collection_includes_the_api_key_header(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    [item] = generate_postman_collection(str(notebook_path))["item"]
+
+    headers = {h["key"]: h["value"] for h in item["request"]["header"]}
+    assert headers["X-API-Key"] == "{{api_key}}"
+
+
+def test_generate_postman_collection_adds_a_task_status_request_for_a_background_function(
+    tmp_path
+):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path, "def train_model(epochs: int) -> str:\n    return 'done'\n"
+    )
+
+    collection = generate_postman_collection(str(notebook_path))
+
+    names = [item["name"] for item in collection["item"]]
+    assert names == ["train_model", "train_model - Task Status"]
+
+    submission_item, status_item = collection["item"]
+
+    assert "task_id" in submission_item["request"]["description"]
+    assert submission_item["event"][0]["listen"] == "test"
+    assert any(
+        "train_model_task_id" in line
+        for line in submission_item["event"][0]["script"]["exec"]
+    )
+
+    assert status_item["request"]["method"] == "GET"
+    assert status_item["request"]["url"]["raw"] == (
+        "{{base_url}}/tasks/{{train_model_task_id}}"
+    )
+
+    variables = {v["key"]: v["value"] for v in collection["variable"]}
+    assert variables["train_model_task_id"] == ""
+
+
+def test_generate_postman_collection_omits_task_status_request_for_a_synchronous_function(
+    tmp_path
+):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    [item] = generate_postman_collection(str(notebook_path))["item"]
+
+    assert "event" not in item
+    assert "description" not in item["request"]
+
+
+def test_generate_postman_collection_excludes_a_reserved_name_conflict(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path,
+        "def health_check() -> dict:\n    return {}\n\n"
+        "def add(a: int, b: int) -> int:\n    return a + b\n",
+    )
+
+    items = generate_postman_collection(str(notebook_path))["item"]
+
+    assert len(items) == 1
+    assert items[0]["name"] == "add"
+
+
+def test_generate_postman_collection_only_restricts_to_the_named_functions(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path,
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n",
+    )
+
+    items = generate_postman_collection(str(notebook_path), only=["add"])["item"]
+
+    assert [item["name"] for item in items] == ["add"]
+
+
+def test_generate_postman_collection_exclude_omits_the_named_functions(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path,
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n",
+    )
+
+    items = generate_postman_collection(str(notebook_path), exclude=["subtract"])["item"]
+
+    assert [item["name"] for item in items] == ["add"]
+
+
+def test_generate_postman_collection_rejects_only_and_exclude_together(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    with pytest.raises(ValueError):
+        generate_postman_collection(str(notebook_path), only=["add"], exclude=["add"])
+
+
+def test_generate_postman_collection_rejects_an_unknown_only_name(tmp_path):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        notebook_path, "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    with pytest.raises(ValueError):
+        generate_postman_collection(str(notebook_path), only=["does_not_exist"])
+
+
+def test_generate_postman_collection_returns_an_empty_item_list_for_a_notebook_with_no_functions(
+    tmp_path
+):
+
+    notebook_path = tmp_path / "nb.ipynb"
+    _write_notebook(notebook_path, "x = 1\n")
+
+    assert generate_postman_collection(str(notebook_path))["item"] == []
