@@ -17,7 +17,8 @@ RESERVED_INFRASTRUCTURE_NAMES = frozenset({
     "GENERATED_AT", "PYTHON_VERSION", "NOTEBOOK_TO_API_VERSION", "ALLOWED_ORIGINS",
     "PUBLIC_URL", "DISABLE_DOCS",
     "MAX_REQUEST_BODY_BYTES", "MaxRequestBodySizeMiddleware",
-    "MAX_PENDING_TASKS", "WEBHOOK_TIMEOUT_SECONDS", "_deliver_task_webhook",
+    "MAX_PENDING_TASKS", "WEBHOOK_TIMEOUT_SECONDS", "WEBHOOK_SECRET",
+    "_deliver_task_webhook",
     "verify_api_key", "custom_openapi",
     "root", "health_check", "readiness_check", "auth_status", "auth_info",
     "validate_auth", "service_info", "service_config", "metrics", "uptime",
@@ -142,6 +143,20 @@ GENERATED_APP_ENV_VARS = [
             "timing out, or being misconfigured -- this only bounds "
             "how long that one delivery attempt can block the worker "
             "thread running it."
+        ),
+    },
+    {
+        "name": "NOTEBOOK_API_WEBHOOK_SECRET",
+        "default": "",
+        "description": (
+            "Shared secret used to sign a background task's own optional "
+            "?callback_url= webhook delivery with HMAC-SHA256, sent as "
+            "X-Webhook-Signature: sha256=<hex>, so the receiving endpoint "
+            "can verify a request actually came from this app and wasn't "
+            "tampered with in transit -- the same X-Hub-Signature-256 "
+            "contract GitHub/Stripe webhooks already use. Empty (the "
+            "default) sends the webhook unsigned, exactly as before this "
+            "existed."
         ),
     },
     {
@@ -814,6 +829,24 @@ def generate_fastapi_code(
         f'"{_generated_app_env_var_default("NOTEBOOK_API_WEBHOOK_TIMEOUT_SECONDS")}"'
         '))'
     )
+    # Read by _deliver_task_webhook below to sign the webhook body with
+    # HMAC-SHA256 (the same X-Hub-Signature-256 contract GitHub/Stripe
+    # webhooks already use) -- empty (the default) sends the webhook
+    # unsigned, exactly as before this existed. A caller-supplied
+    # ?callback_url= is, by definition, a URL the caller themselves
+    # chose to receive this app's own task results at, but it's still
+    # commonly a public endpoint reachable by anyone who learns it (a
+    # webhook.site-style debugging URL, or a real endpoint whose path
+    # alone isn't a secret) -- without a signature, that endpoint's own
+    # handler has no way to tell a request that actually came from this
+    # app apart from one an attacker crafted by hand with a guessed or
+    # leaked task_id/result.
+    lines.append(
+        'WEBHOOK_SECRET = os.getenv('
+        '"NOTEBOOK_API_WEBHOOK_SECRET", '
+        f'"{_generated_app_env_var_default("NOTEBOOK_API_WEBHOOK_SECRET")}"'
+        ')'
+    )
     lines.append(
         '# A comma-separated list, not a single value, so a key can be'
     )
@@ -1213,6 +1246,7 @@ def generate_fastapi_code(
     lines.append("        'task_ttl_seconds': TASK_TTL_SECONDS,")
     lines.append("        'max_pending_tasks': MAX_PENDING_TASKS,")
     lines.append("        'webhook_timeout_seconds': WEBHOOK_TIMEOUT_SECONDS,")
+    lines.append("        'webhook_signing_enabled': bool(WEBHOOK_SECRET),")
     lines.append("        'rate_limit_per_minute': RATE_LIMIT_PER_MINUTE or None,")
     lines.append("        'allowed_origins': ALLOWED_ORIGINS,")
     lines.append("        'disable_docs': DISABLE_DOCS,")
@@ -1463,13 +1497,41 @@ def generate_fastapi_code(
     # top of the task's own real result, which is already durably recorded
     # in TASKS by the time this is ever called; a caller who needs a
     # guarantee should poll get_task/wait_for_task instead.
+    #
+    # When WEBHOOK_SECRET is configured, the request also carries an
+    # X-Webhook-Signature: sha256=<hex hmac> header -- computed over the
+    # exact same `body` bytes being sent, using hmac.compare_digest's own
+    # module (already imported above for API-key comparison) rather than
+    # a second, separate crypto dependency. digestmod is passed as the
+    # plain string "sha256" specifically so this needs no `import
+    # hashlib` of its own: hmac.new resolves a string digestmod via
+    # hashlib.new internally. A receiving endpoint recomputes the same
+    # HMAC over the raw body it received (using the identical shared
+    # secret) and compares it against this header -- via
+    # hmac.compare_digest, never `==`, for the same timing-attack reason
+    # verify_api_key below already uses it -- to confirm both that the
+    # request actually came from this app and that the body wasn't
+    # altered in transit, the same X-Hub-Signature-256 contract GitHub/
+    # Stripe webhooks already use. Omitted entirely when WEBHOOK_SECRET
+    # is empty (the default), so an existing receiver that predates this
+    # feature keeps working unmodified.
     lines.append("def _deliver_task_webhook(callback_url, payload):")
     lines.append("    try:")
     lines.append("        body = json.dumps(payload).encode('utf-8')")
+    lines.append("        headers = {'Content-Type': 'application/json'}")
+    lines.append("        if WEBHOOK_SECRET:")
+    lines.append("            signature = hmac.new(")
+    lines.append(
+        "                WEBHOOK_SECRET.encode('utf-8'), body, 'sha256'"
+    )
+    lines.append("            ).hexdigest()")
+    lines.append(
+        "            headers['X-Webhook-Signature'] = f'sha256={signature}'"
+    )
     lines.append("        request = urllib.request.Request(")
     lines.append("            callback_url,")
     lines.append("            data=body,")
-    lines.append("            headers={'Content-Type': 'application/json'},")
+    lines.append("            headers=headers,")
     lines.append("            method='POST',")
     lines.append("        )")
     lines.append(

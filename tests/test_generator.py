@@ -33,6 +33,7 @@ def test_generated_app_env_vars_default_matches_the_actual_generated_code():
         "NOTEBOOK_API_MAX_TASKS",
         "NOTEBOOK_API_RATE_LIMIT_PER_MINUTE",
         "NOTEBOOK_API_WEBHOOK_TIMEOUT_SECONDS",
+        "NOTEBOOK_API_WEBHOOK_SECRET",
         "NOTEBOOK_API_PUBLIC_URL",
         "NOTEBOOK_API_DISABLE_DOCS",
     }
@@ -493,6 +494,7 @@ def test_generated_app_exposes_get_config_reporting_its_own_runtime_limits(monke
         "'task_ttl_seconds': TASK_TTL_SECONDS,",
         "'max_pending_tasks': MAX_PENDING_TASKS,",
         "'webhook_timeout_seconds': WEBHOOK_TIMEOUT_SECONDS,",
+        "'webhook_signing_enabled': bool(WEBHOOK_SECRET),",
         "'rate_limit_per_minute': RATE_LIMIT_PER_MINUTE or None,",
         "'allowed_origins': ALLOWED_ORIGINS,",
         "'disable_docs': DISABLE_DOCS,",
@@ -515,6 +517,7 @@ def test_generated_app_exposes_get_config_reporting_its_own_runtime_limits(monke
     assert body["task_ttl_seconds"] == 3600
     assert body["max_pending_tasks"] == 10000
     assert body["webhook_timeout_seconds"] == 5
+    assert body["webhook_signing_enabled"] is False
     assert body["rate_limit_per_minute"] is None
     assert body["allowed_origins"] == ["*"]
     assert body["disable_docs"] is False
@@ -640,6 +643,20 @@ def test_notebook_function_named_webhook_timeout_seconds_is_rejected():
     ]
 
     with pytest.raises(ReservedFunctionNameError, match="WEBHOOK_TIMEOUT_SECONDS"):
+        generate_fastapi_code(functions)
+
+
+def test_notebook_function_named_webhook_secret_is_rejected():
+    """WEBHOOK_SECRET is a module-level name the generated app itself
+    defines (see RESERVED_INFRASTRUCTURE_NAMES) -- same collision hazard
+    class as WEBHOOK_TIMEOUT_SECONDS or MAX_PENDING_TASKS.
+    """
+
+    functions = [
+        {"name": "WEBHOOK_SECRET", "args": [], "return_type": "dict"}
+    ]
+
+    with pytest.raises(ReservedFunctionNameError, match="WEBHOOK_SECRET"):
         generate_fastapi_code(functions)
 
 
@@ -844,6 +861,171 @@ def test_webhook_delivery_failure_does_not_affect_task_result(monkeypatch):
     task = namespace["TASKS"][task_id]
     assert task["status"] == "completed"
     assert task["result"] == "ok"
+
+
+def test_webhook_delivery_omits_signature_header_when_no_secret_configured(
+    monkeypatch
+):
+    """The overwhelmingly common case (NOTEBOOK_API_WEBHOOK_SECRET unset)
+    must behave exactly as before this feature -- no signature header at
+    all, so an existing receiver that predates this feature keeps working
+    unmodified.
+    """
+    import urllib.request
+
+    monkeypatch.delenv("NOTEBOOK_API_WEBHOOK_SECRET", raising=False)
+
+    functions = [{"name": "process_data", "args": [], "return_type": "dict"}]
+
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["notebook_module"].process_data = lambda: "ok"
+
+    captured = {}
+
+    class _FakeResponse:
+        def close(self):
+            pass
+
+    def fake_urlopen(request, timeout=None):
+        captured["request"] = request
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    response = client.post(
+        "/process_data",
+        json={},
+        params={"callback_url": "https://example.test/hook"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+
+    assert captured["request"].get_header("X-webhook-signature") is None
+
+
+def test_webhook_delivery_includes_hmac_signature_when_secret_configured(
+    monkeypatch
+):
+    """Confirmed missing before this feature: a receiver of a background
+    task's own webhook delivery had no way to verify a request actually
+    came from this app (rather than an attacker who guessed or leaked the
+    callback_url) -- NOTEBOOK_API_WEBHOOK_SECRET, when set, now signs the
+    exact request body with HMAC-SHA256, the same X-Hub-Signature-256
+    contract GitHub/Stripe webhooks already use.
+    """
+    import hashlib
+    import hmac
+    import urllib.request
+
+    monkeypatch.setenv("NOTEBOOK_API_WEBHOOK_SECRET", "s3cr3t")
+
+    functions = [{"name": "process_data", "args": [], "return_type": "dict"}]
+
+    code = generate_fastapi_code(functions)
+
+    _register_fake_notebook_module(monkeypatch)
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["notebook_module"].process_data = lambda: {"score": 0.9}
+
+    captured = {}
+
+    class _FakeResponse:
+        def close(self):
+            pass
+
+    def fake_urlopen(request, timeout=None):
+        captured["request"] = request
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(namespace["app"])
+    headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+    response = client.post(
+        "/process_data",
+        json={},
+        params={"callback_url": "https://example.test/hook"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+
+    request = captured["request"]
+    # urllib.request.Request.get_header does an exact lookup against its
+    # own stored key, which add_header/the constructor already normalize
+    # via str.capitalize() ("X-Webhook-Signature" -> "X-webhook-signature")
+    # -- not a case-insensitive lookup, so the header name here must match
+    # that exact casing.
+    signature_header = request.get_header("X-webhook-signature")
+    assert signature_header is not None
+
+    expected_signature = "sha256=" + hmac.new(
+        b"s3cr3t", request.data, hashlib.sha256
+    ).hexdigest()
+    assert signature_header == expected_signature
+
+
+def test_webhook_delivery_signature_changes_when_secret_changes(monkeypatch):
+    """A different NOTEBOOK_API_WEBHOOK_SECRET must produce a different
+    signature over the exact same body -- otherwise the secret wouldn't
+    actually be doing any verification work.
+    """
+    import urllib.request
+
+    functions = [{"name": "process_data", "args": [], "return_type": "dict"}]
+
+    def _deliver_with_secret(secret):
+        monkeypatch.setenv("NOTEBOOK_API_WEBHOOK_SECRET", secret)
+
+        code = generate_fastapi_code(functions)
+
+        _register_fake_notebook_module(monkeypatch)
+        namespace = {}
+        exec(compile(code, "<generated>", "exec"), namespace)
+        namespace["notebook_module"].process_data = lambda: "ok"
+
+        captured = {}
+
+        class _FakeResponse:
+            def close(self):
+                pass
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+            return _FakeResponse()
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(namespace["app"])
+        headers = {"X-API-Key": "notebook-to-api-dev-key"}
+
+        client.post(
+            "/process_data",
+            json={},
+            params={"callback_url": "https://example.test/hook"},
+            headers=headers,
+        )
+
+        return captured["request"].get_header("X-webhook-signature")
+
+    signature_a = _deliver_with_secret("secret-a")
+    signature_b = _deliver_with_secret("secret-b")
+
+    assert signature_a != signature_b
 
 
 def test_route_generation():
