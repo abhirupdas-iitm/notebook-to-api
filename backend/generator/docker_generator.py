@@ -369,6 +369,27 @@ def readme_content(package_name="generated", functions=None, env_vars=None):
     and whatever the notebook author's own commit message happened to say
     elsewhere.
 
+    Confirmed exploitable -- as a documentation bug, not a code one, but
+    a real one nonetheless -- in the original version of this text: it
+    claimed "every built-in [route] -- /health, /ready, /info, /config,
+    /metrics, /uptime, /auth/status, /auth/info, /auth/validate, /tasks,
+    /tasks/{{task_id}}) requires an X-API-Key header", but
+    RESERVED_INFRASTRUCTURE_NAMES' own generated code (api_generator.py)
+    shows eight of those eleven -- every one except /auth/validate and
+    the /tasks routes -- are `def health_check():`/`def metrics():`/...
+    with no `Depends(verify_api_key)` parameter at all, deliberately: a
+    load balancer, a Kubernetes liveness/readiness probe, and a
+    Prometheus scraper (see GET /metrics/prometheus, added since this
+    text was first written) all need to reach these with no credential
+    of their own. An operator reading this file had no way to know that
+    short of testing each route by hand or reading api_generator.py's
+    own source -- and worse, a false "this needs an API key" belief about
+    an already-public route is the kind of mistake that leads to
+    "protecting" it with something else redundant, or never noticing it
+    was reachable without one at all. Split into two explicit lists
+    below instead, so this file can never again claim a status a real
+    request to that route wouldn't actually get.
+
     `functions` is the same list generate_fastapi_code (api_generator.py)
     itself compiles into endpoints -- each already carrying "name" and,
     for a background one, matching LONG_RUNNING_KEYWORDS. Reusing that
@@ -424,10 +445,18 @@ on every recompile. Edit the source notebook instead.
 
 ## Endpoints
 
-Every endpoint below (and every built-in one -- `/health`, `/ready`, \
-`/info`, `/config`, `/metrics`, `/uptime`, `/auth/status`, `/auth/info`, \
-`/auth/validate`, `/tasks`, `/tasks/{{task_id}}`) requires an \
-`X-API-Key` header. See Authentication below.
+Every endpoint below requires an `X-API-Key` header. See Authentication \
+below.
+
+So do these built-in ones: `/auth/validate`, `/tasks`, and every other \
+`/tasks/...` route (`/tasks/{{task_id}}`, `/tasks/completed`, \
+`/tasks/failed`, `/tasks/cleanup`, `/tasks/reset`).
+
+These built-in ones deliberately do **not** -- so a load balancer, a \
+Kubernetes liveness/readiness probe, or a Prometheus scraper can reach \
+them with no credential of its own: `/health`, `/ready`, `/info`, \
+`/config`, `/metrics`, `/metrics/prometheus`, `/uptime`, \
+`/auth/status`, `/auth/info`.
 
 {endpoints_section}
 

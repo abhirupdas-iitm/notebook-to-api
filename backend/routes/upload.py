@@ -62,6 +62,7 @@ from backend.generator.docker_generator import (
     dockerignore_content,
     docker_compose_content,
     env_example_content,
+    readme_content,
 )
 from backend.generator.kubernetes_generator import (
     kubernetes_manifest_content,
@@ -10702,6 +10703,161 @@ def app_preview_endpoint(data: dict):
         "version_id": version_id,
         "package_name": package_name,
         "app_code": app_code,
+    }
+
+
+@router.post("/readme-preview")
+def readme_preview_endpoint(data: dict):
+    """The exact README.md text POST /api/compile would write for an
+    already-uploaded notebook -- without actually compiling it, or
+    touching GENERATED_DIR (or whatever it currently backs) at all.
+
+    Every other artifact a real compile writes already has a preview of
+    its own -- POST /api/app-preview (app.py), POST
+    /api/requirements-preview (requirements.txt), GET
+    /api/dockerfile-preview/GET /api/docker-compose-preview/GET
+    /api/env-example-preview/GET /api/k8s-preview -- except this one:
+    README.md was the one real compile-produced artifact with no way to
+    see ahead of time at all, short of actually POST /api/compile-ing the
+    notebook for real (replacing whatever GENERATED_DIR currently serves,
+    live, for every other caller of this dashboard) and only then reading
+    it back via GET /api/generated/README.md.
+
+    Reuses the exact same function-building steps POST /api/app-preview
+    already does, in the same order, up to and including
+    generate_fastapi_code itself -- not because "app_code" is needed here
+    (it's discarded), but because generate_fastapi_code is the one place
+    ReservedFunctionNameError is actually raised, and a real compile of a
+    notebook with a reserved-name collision fails there too, before ever
+    reaching the point where it would write README.md at all. Skipping
+    that check here would let this endpoint preview a README a real
+    compile of the same notebook could never actually produce -- the
+    exact "preview drifts from what a real compile would produce"
+    failure mode every sibling preview endpoint in this file already
+    guards against for its own artifact.
+
+    Reuses readme_content directly -- the same pure string-building
+    helper generate_readme itself calls before ever touching disk -- so
+    "readme" below can never drift from what an actual compile of the
+    same notebook (with the same only/exclude) would write to
+    GENERATED_DIR/README.md.
+
+    "package_name" always reflects GENERATED_DIR's own basename, the
+    same package name an actual POST /api/compile of this notebook would
+    use, since every compile through this dashboard always targets that
+    one fixed directory -- and the same name POST /api/app-preview's own
+    identical field already reports.
+
+    "only"/"exclude"/"version_id" mirror POST /api/app-preview's own
+    exactly (see its docstring) -- an invalid value gets the identical
+    400 here that it would there, and "version_id" previews the README
+    for one of "notebook_path"'s own previously snapshotted versions
+    instead of its current content.
+    """
+
+    notebook_path = data.get("notebook_path")
+
+    if not notebook_path:
+
+        raise HTTPException(
+            status_code=400,
+            detail="notebook_path is required"
+        )
+
+    only = data.get("only")
+    exclude = data.get("exclude")
+    version_id = data.get("version_id")
+
+    for field_name, field_value in (("only", only), ("exclude", exclude)):
+
+        if field_value is not None and (
+            not isinstance(field_value, list)
+            or not all(isinstance(item, str) for item in field_value)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a list of strings"
+            )
+
+    if only and exclude:
+
+        raise HTTPException(
+            status_code=400,
+            detail="only and exclude can't both be given -- choose one."
+        )
+
+    full_path = _resolve_preview_content_path(notebook_path, version_id)
+
+    try:
+
+        notebook = load_notebook(str(full_path))
+
+        code_cells = [
+            cell for cell in extract_code_cells(notebook)
+            if is_parseable_python(cell)
+        ]
+
+        functions = []
+
+        for cell in code_cells:
+            functions.extend(extract_functions_from_code(cell))
+
+        functions = deduplicate_functions_by_name(functions)
+
+        functions, exclude = _drop_private_functions(
+            functions, code_cells, only, exclude
+        )
+
+        functions = _filter_functions_by_name(functions, only, exclude)
+
+        package_name = package_name_for_output_dir(GENERATED_DIR)
+
+        # Discarded -- see this endpoint's own docstring for why this is
+        # still called: it's the one place a reserved-name collision is
+        # actually caught, and a real compile of this same notebook would
+        # fail here too, before ever reaching README.md.
+        generate_fastapi_code(
+            functions, package_name,
+            source_notebook_sha256=hash_notebook_file(full_path),
+            notebook_to_api_version=NOTEBOOK_TO_API_VERSION,
+        )
+
+        readme = readme_content(package_name, functions, GENERATED_APP_ENV_VARS)
+
+    except ReservedFunctionNameError as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+
+    except MALFORMED_NOTEBOOK_ERRORS as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Uploaded file is not a valid Jupyter notebook: {e}"
+        )
+
+    except ValueError as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Preview error: {str(e)}"
+        )
+
+    return {
+        "status": "success",
+        "notebook": notebook_path,
+        "version_id": version_id,
+        "package_name": package_name,
+        "readme": readme,
     }
 
 

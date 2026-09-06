@@ -18763,6 +18763,326 @@ def test_app_preview_returns_404_for_an_unknown_version_id():
     assert resp.status_code == 404
 
 
+def test_readme_preview_matches_what_an_actual_compile_writes():
+
+    content = _notebook_bytes(
+        "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    upload_resp = client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "readme_preview_match.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+    assert upload_resp.status_code == 200
+
+    preview_resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_match.ipynb"},
+    )
+    assert preview_resp.status_code == 200
+    preview_body = preview_resp.json()
+    assert preview_body["status"] == "success"
+    assert preview_body["notebook"] == "readme_preview_match.ipynb"
+    assert preview_body["package_name"] == "generated"
+    assert "`POST /add`" in preview_body["readme"]
+
+    compile_resp = client.post(
+        "/api/compile",
+        json={"notebook_path": "readme_preview_match.ipynb"},
+    )
+    assert compile_resp.status_code == 200
+
+    actual_readme = client.get("/api/generated/README.md").json()["content"]
+
+    assert preview_body["readme"] == actual_readme
+
+
+def test_readme_preview_reports_accurate_authentication_requirements():
+    """Confirmed exploitable as a documentation bug before this fix: the
+    generated README claimed every built-in route needed an X-API-Key
+    header, but health_check/readiness_check/service_info/service_config/
+    metrics/metrics_prometheus/uptime/auth_status/auth_info (backend/
+    generator/api_generator.py) all define their own route with no
+    Depends(verify_api_key) at all.
+    """
+
+    _upload_sample_notebook("readme_preview_auth.ipynb")
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_auth.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    readme = resp.json()["readme"]
+    assert "/health" in readme
+    assert "/metrics/prometheus" in readme
+    assert "deliberately" in readme.lower()
+
+
+def test_readme_preview_flags_a_background_function():
+
+    content = _notebook_bytes(
+        "def train_model(epochs: int) -> str:\n    return 'done'\n"
+    )
+
+    client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "readme_preview_background.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_background.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    assert "enqueues a background task" in resp.json()["readme"]
+
+
+def test_readme_preview_only_restricts_to_the_named_functions():
+
+    content = _notebook_bytes(
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n"
+    )
+
+    client.post(
+        "/api/upload",
+        files={"file": ("readme_preview_only.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_only.ipynb", "only": ["add"]},
+    )
+
+    assert resp.status_code == 200
+    readme = resp.json()["readme"]
+    assert "`POST /add`" in readme
+    assert "`POST /subtract`" not in readme
+
+
+def test_readme_preview_exclude_omits_the_named_functions():
+
+    content = _notebook_bytes(
+        "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n    return a - b\n"
+    )
+
+    client.post(
+        "/api/upload",
+        files={"file": ("readme_preview_exclude.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_exclude.ipynb", "exclude": ["subtract"]},
+    )
+
+    assert resp.status_code == 200
+    readme = resp.json()["readme"]
+    assert "`POST /add`" in readme
+    assert "`POST /subtract`" not in readme
+
+
+def test_readme_preview_never_exposes_a_private_directive_marked_function():
+
+    content = _notebook_bytes(
+        "# notebook-to-api: private\n"
+        "def helper(x: int) -> int:\n    return x\n\n"
+        "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    client.post(
+        "/api/upload",
+        files={"file": ("readme_preview_private.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_private.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    readme = resp.json()["readme"]
+    assert "`POST /add`" in readme
+    assert "helper" not in readme
+
+
+def test_readme_preview_rejects_both_only_and_exclude():
+
+    content = _notebook_bytes("def add(a: int, b: int) -> int:\n    return a + b\n")
+
+    client.post(
+        "/api/upload",
+        files={"file": ("readme_preview_both.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={
+            "notebook_path": "readme_preview_both.ipynb",
+            "only": ["add"], "exclude": ["add"],
+        },
+    )
+
+    assert resp.status_code == 400
+
+
+def test_readme_preview_returns_400_for_an_unknown_only_name():
+
+    content = _notebook_bytes("def add(a: int, b: int) -> int:\n    return a + b\n")
+
+    client.post(
+        "/api/upload",
+        files={"file": ("readme_preview_unknown.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_unknown.ipynb", "only": ["does_not_exist"]},
+    )
+
+    assert resp.status_code == 400
+
+
+def test_readme_preview_returns_400_for_a_reserved_function_name():
+    """A real compile of a notebook with a reserved-name collision fails
+    before ever reaching README.md at all -- this preview must fail the
+    identical way, not silently preview a README a real compile could
+    never actually produce.
+    """
+
+    content = _notebook_bytes("def health_check() -> dict:\n    return {}\n")
+
+    client.post(
+        "/api/upload",
+        files={"file": ("readme_preview_reserved.ipynb", io.BytesIO(content), "application/json")},
+    )
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_reserved.ipynb"},
+    )
+
+    assert resp.status_code == 400
+    assert "health_check" in resp.json()["detail"]
+
+
+def test_readme_preview_does_not_touch_generated_dir(monkeypatch, tmp_path):
+
+    content = _notebook_bytes("def add(a: int, b: int) -> int:\n    return a + b\n")
+
+    upload_resp = client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "readme_preview_no_side_effects.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+    assert upload_resp.status_code == 200
+
+    generated_dir = tmp_path / "readme_preview_generated"
+    monkeypatch.setattr("backend.routes.upload.GENERATED_DIR", str(generated_dir))
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": "readme_preview_no_side_effects.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    assert not generated_dir.exists()
+
+
+def test_readme_preview_returns_404_for_a_missing_notebook():
+
+    resp = client.post(
+        "/api/readme-preview", json={"notebook_path": "does_not_exist.ipynb"}
+    )
+
+    assert resp.status_code == 404
+
+
+def test_readme_preview_returns_400_for_a_malformed_notebook_file():
+
+    filename = "readme_preview_malformed.ipynb"
+    file_path = os.path.join(UPLOAD_DIR, filename)
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("not valid json at all")
+
+    resp = client.post("/api/readme-preview", json={"notebook_path": filename})
+
+    assert resp.status_code == 400
+
+
+def test_readme_preview_requires_a_notebook_path():
+
+    resp = client.post("/api/readme-preview", json={})
+
+    assert resp.status_code == 400
+
+
+def test_readme_preview_with_version_id_previews_that_snapshots_source():
+
+    filename = "readme_preview_version_id.ipynb"
+
+    content_v1 = _notebook_bytes("def add(a: int, b: int) -> int:\n    return a + b\n")
+    client.post(
+        "/api/upload",
+        files={"file": (filename, io.BytesIO(content_v1), "application/json")},
+    )
+
+    content_v2 = _notebook_bytes("def multiply(a: int, b: int) -> int:\n    return a * b\n")
+    client.post(
+        "/api/upload?overwrite=true",
+        files={"file": (filename, io.BytesIO(content_v2), "application/json")},
+    )
+
+    versions = client.get(f"/api/notebooks/{filename}/versions").json()["versions"]
+    version_id = versions[0]["version_id"]
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": filename, "version_id": version_id},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["version_id"] == version_id
+    assert "`POST /add`" in body["readme"]
+    assert "`POST /multiply`" not in body["readme"]
+
+
+def test_readme_preview_returns_404_for_an_unknown_version_id():
+
+    filename = "readme_preview_version_id_unknown.ipynb"
+    _upload_sample_notebook(filename)
+
+    resp = client.post(
+        "/api/readme-preview",
+        json={"notebook_path": filename, "version_id": "does-not-exist.ipynb"},
+    )
+
+    assert resp.status_code == 404
+
+
 def test_curl_preview_returns_one_command_per_function():
 
     content = _notebook_bytes(

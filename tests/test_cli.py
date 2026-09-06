@@ -11803,6 +11803,166 @@ def test_app_preview_command_reports_a_clean_error_when_the_dashboard_is_unreach
     _assert_clean_cli_error(proc, "Is it running?")
 
 
+def test_readme_preview_command_is_registered():
+
+    proc = _run_cli(["--help"], cwd=Path.cwd())
+
+    assert proc.returncode == 0
+    assert "readme-preview" in proc.stdout
+
+
+def test_readme_preview_command_prints_the_generated_readme(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success",
+            "notebook": "nb.ipynb",
+            "package_name": "generated",
+            "readme": "# generated\n\n## Endpoints\n",
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["readme-preview", "nb.ipynb", "--dashboard-url", dashboard_url],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "README.md preview for 'nb.ipynb'" in proc.stdout
+    assert "package 'generated'" in proc.stdout
+    assert "## Endpoints" in proc.stdout
+    assert handler.requests == ["/api/readme-preview"]
+    assert json.loads(handler.bodies[0]) == {
+        "notebook_path": "nb.ipynb", "only": None, "exclude": None,
+    }
+
+
+def test_readme_preview_command_passes_only_and_exclude(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success",
+            "notebook": "nb.ipynb",
+            "package_name": "generated",
+            "readme": "# generated\n",
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "readme-preview", "nb.ipynb", "--only", "add, subtract",
+            "--dashboard-url", dashboard_url,
+        ],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(handler.bodies[0]) == {
+        "notebook_path": "nb.ipynb", "only": ["add", "subtract"], "exclude": None,
+    }
+
+
+def test_readme_preview_command_passes_the_version_id_flag_through(tmp_path, fake_dashboard):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success",
+            "notebook": "nb.ipynb",
+            "version_id": "v1.ipynb",
+            "package_name": "generated",
+            "readme": "# generated\n",
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "readme-preview", "nb.ipynb",
+            "--dashboard-url", dashboard_url, "--version-id", "v1.ipynb",
+        ],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "'nb.ipynb' version 'v1.ipynb'" in proc.stdout
+    assert json.loads(handler.bodies[0]) == {
+        "notebook_path": "nb.ipynb", "only": None, "exclude": None,
+        "version_id": "v1.ipynb",
+    }
+
+
+def test_readme_preview_command_json_flag_emits_the_dashboards_own_response(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    body = {
+        "status": "success", "notebook": "nb.ipynb",
+        "package_name": "generated", "readme": "# generated\n",
+    }
+    handler.responses = [_json_response(200, body)]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["readme-preview", "nb.ipynb", "--dashboard-url", dashboard_url, "--json"],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout) == body
+
+
+def test_readme_preview_command_reports_a_clean_error_for_a_missing_notebook(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(404, {"detail": "Notebook file not found"})
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["readme-preview", "nb.ipynb", "--dashboard-url", dashboard_url],
+        cwd=workdir,
+    )
+
+    _assert_clean_cli_error(proc, "Notebook file not found")
+
+
+def test_readme_preview_command_reports_a_clean_error_when_the_dashboard_is_unreachable(
+    tmp_path,
+):
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "readme-preview", "nb.ipynb",
+            "--dashboard-url", "http://127.0.0.1:1", "--timeout", "5",
+        ],
+        cwd=workdir,
+    )
+
+    _assert_clean_cli_error(proc, "Is it running?")
+
+
 def test_curl_preview_command_is_registered():
 
     proc = _run_cli(["--help"], cwd=Path.cwd())

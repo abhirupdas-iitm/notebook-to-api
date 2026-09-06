@@ -355,7 +355,7 @@ _CORE_COMMANDS = frozenset({
     "remote-compile", "remote-inspect", "remote-build",
     "versions", "remote-files", "remote-diff", "diff-notebooks", "remote-export", "remote-deploy",
     "status", "remote-validate", "validate-all", "requirements-preview", "curl-preview",
-    "remote-curl", "app-preview", "dockerfile-preview", "docker-compose-preview", "env-example-preview", "env-vars-preview",
+    "remote-curl", "app-preview", "readme-preview", "dockerfile-preview", "docker-compose-preview", "env-example-preview", "env-vars-preview",
     "postman-preview", "k8s-preview",
 })
 
@@ -4266,6 +4266,55 @@ def _dispatch_core_command(args):
                 f"(package '{data.get('package_name')}'):\n"
             )
             print(data.get("app_code", ""))
+
+    elif args.command == "readme-preview":
+        # See `upload` above for why this is imported here rather than at
+        # module scope.
+        import httpx
+
+        dashboard_url = args.dashboard_url.rstrip("/")
+
+        only = _parse_comma_separated_names(args.only)
+        exclude = _parse_comma_separated_names(args.exclude)
+
+        readme_preview_body = {
+            "notebook_path": args.filename,
+            "only": only,
+            "exclude": exclude,
+        }
+        if args.version_id:
+            readme_preview_body["version_id"] = args.version_id
+
+        try:
+            response = httpx.post(
+                f"{dashboard_url}/api/readme-preview",
+                json=readme_preview_body,
+                timeout=args.timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise _dashboard_connection_error(exc, dashboard_url)
+
+        if response.status_code >= 400:
+
+            raise RuntimeError(
+                f"Dashboard rejected the request ({response.status_code}): "
+                f"{_extract_dashboard_error_detail(response)}"
+            )
+
+        data = response.json()
+
+        if args.json_output:
+            print(json.dumps(data, indent=2))
+        else:
+            target = (
+                f"'{args.filename}' version '{args.version_id}'" if args.version_id
+                else f"'{args.filename}'"
+            )
+            print(
+                f"README.md preview for {target} on {dashboard_url} "
+                f"(package '{data.get('package_name')}'):\n"
+            )
+            print(data.get("readme", ""))
 
     elif args.command == "curl-preview":
         # See `upload` above for why this is imported here rather than at
@@ -9180,6 +9229,38 @@ def main():
             "Emit the dashboard's own JSON response ({\"status\", "
             "\"notebook\", \"version_id\", \"package_name\", "
             "\"app_code\"}) instead of a human-readable preview, for "
+            "scripting/automation."
+        )
+    )
+
+    # readme-preview command (preview the generated README.md for a
+    # notebook already uploaded to a running dashboard, via its own POST
+    # /api/readme-preview -- README.md was the one real compile-produced
+    # artifact with no preview of its own before this; mirrors
+    # app-preview above exactly, just for README.md instead of app.py)
+    readme_preview_parser = subparsers.add_parser(
+        "readme-preview",
+        help=(
+            "Preview the exact README.md a compile of an "
+            "already-uploaded notebook would produce, via its POST "
+            "/api/readme-preview -- without actually compiling it."
+        )
+    )
+    readme_preview_parser.add_argument(
+        "filename",
+        help="Filename of the notebook already uploaded to the dashboard, as reported by `list`."
+    )
+    _add_dashboard_url_and_timeout_arguments(readme_preview_parser)
+    _add_function_selection_arguments(readme_preview_parser)
+    _add_version_id_argument(readme_preview_parser, "POST /api/readme-preview")
+    readme_preview_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help=(
+            "Emit the dashboard's own JSON response ({\"status\", "
+            "\"notebook\", \"version_id\", \"package_name\", "
+            "\"readme\"}) instead of a human-readable preview, for "
             "scripting/automation."
         )
     )
