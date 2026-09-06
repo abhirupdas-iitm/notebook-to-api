@@ -473,6 +473,79 @@ def _extract_explicit_requirements(code_cells):
     return specs
 
 
+# Recognizes a "# notebook-to-api: apt-requires <package>" comment
+# directive anywhere in a code cell's raw source -- see
+# _extract_explicit_apt_packages below for what it's for. Same matching
+# rules as REQUIREMENT_DIRECTIVE_PATTERN above (leading whitespace
+# allowed, "#" must start the line, matched against raw cell text rather
+# than the AST) for the identical reason: usable indented inside a
+# function body, immune to an unrelated inline comment merely containing
+# this phrase elsewhere in a line, and invisible to `ast.parse` in the
+# first place.
+APT_REQUIREMENT_DIRECTIVE_PATTERN = re.compile(
+    r"^\s*#\s*notebook-to-api:\s*apt-requires\s+(?P<package>\S+)\s*$",
+    re.MULTILINE,
+)
+
+
+def _extract_explicit_apt_packages(code_cells):
+    """Debian/Ubuntu (apt) package names a notebook author declares
+    explicitly via a "# notebook-to-api: apt-requires <package>" comment
+    directive, one per line, anywhere in any code cell -- in the order
+    first seen, with exact-duplicate lines removed.
+
+    REQUIREMENT_DIRECTIVE_PATTERN's own "requires" directive (above)
+    already lets a notebook author hand-declare an extra requirements.txt
+    line this tool's own import-scanning can't infer on its own -- but a
+    requirements.txt line is still just a PyPI package name; it has no
+    way to express a *system* library or build tool a notebook's own
+    dependency needs already present *inside the image* before `pip
+    install` (or the notebook's own code) can succeed at all: `psycopg2`
+    (not the `-binary` wheel many production deployments deliberately
+    avoid) needs libpq-dev and a C compiler just to build; `mysqlclient`
+    needs default-libmysqlclient-dev; `weasyprint`/`playwright` each need
+    a handful of native shared libraries; `opencv-python`'s own wheel
+    installs cleanly but segfaults the moment it's actually imported
+    inside python:3.x-slim, which never ships libgl1 at all. Before this,
+    a notebook needing any of these had exactly one path to a working
+    image: hand-editing the generated Dockerfile after every single
+    compile to add the missing `apt-get install`, since this tool's own
+    generated one only ever ran `pip install` against a base image with
+    nothing beyond Python itself.
+
+    Each matched <package> is written into the generated Dockerfile's own
+    `apt-get install` line exactly as given (see apt_install_content,
+    backend/generator/docker_generator.py) -- including an explicit
+    version pin ("libpq-dev=13.11-0+deb12u1"), which is valid apt syntax
+    this tool has no reason to second-guess, the identical "copied
+    through verbatim" treatment _extract_explicit_requirements' own
+    directive already gets.
+
+    Unlike _extract_explicit_requirements, raises nothing for two
+    directives naming the same package with different version pins --
+    apt-get itself simply installs whichever mention comes last, not the
+    hard "Double requirement given" failure pip raises for the analogous
+    case, so there is no equivalent failure here worth catching this
+    early.
+    """
+    packages = []
+    seen = set()
+
+    for cell in code_cells:
+
+        for match in APT_REQUIREMENT_DIRECTIVE_PATTERN.finditer(cell):
+
+            package = match.group("package").strip()
+
+            if not package or package in seen:
+                continue
+
+            seen.add(package)
+            packages.append(package)
+
+    return packages
+
+
 # Recognizes a "# notebook-to-api: exclude <import-name>" comment
 # directive -- see _extract_excluded_imports below for what it's for.
 # Same matching rules as REQUIREMENT_DIRECTIVE_PATTERN above (leading
@@ -1226,6 +1299,12 @@ def compile_notebook_to_api(
         # documents fixing for generate_fastapi_code's own checks.
         explicit_requirements = _extract_explicit_requirements(code_cells)
 
+        # Computed here, alongside explicit_requirements above, for the
+        # identical reason: available before generate_dockerfile is ever
+        # called further down, regardless of which branch of this
+        # function's own control flow reaches it.
+        apt_packages = _extract_explicit_apt_packages(code_cells)
+
         functions = []
 
         for cell in code_cells:
@@ -1341,7 +1420,8 @@ def compile_notebook_to_api(
             )
 
             generate_dockerfile(
-                dockerfile_path, package_name, compiling_python_version()
+                dockerfile_path, package_name, compiling_python_version(),
+                apt_packages=apt_packages,
             )
 
             dockerignore_path = os.path.join(

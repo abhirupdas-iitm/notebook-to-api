@@ -3,9 +3,51 @@ import textwrap
 from backend.generator.api_generator import LONG_RUNNING_KEYWORDS
 
 
+def apt_install_content(apt_packages):
+    """The Dockerfile "RUN apt-get ..." block dockerfile_content (below)
+    inserts right after its own base-image ENV lines when `apt_packages`
+    is non-empty, or "" when it's empty/None -- split out so both
+    dockerfile_content and a test can each get exactly this text without
+    re-deriving the surrounding blank-line handling by hand.
+
+    A notebook author's own "# notebook-to-api: apt-requires <package>"
+    directive (see _extract_explicit_apt_packages, backend/compiler.py)
+    needs that package actually present *inside this image*, not just on
+    the machine that compiled the notebook -- some dependencies
+    (`psycopg2`'s own C extension, `mysqlclient`, `weasyprint`'s native
+    libraries, ...) need a system package installed before the `pip
+    install` below can even build them; others (`opencv-python`'s own
+    `libgl1` dependency) install cleanly and only fail at *runtime*, well
+    after a successful `docker build`, with nothing at build time to
+    explain why. Placed before `pip install` specifically: a package
+    needing a system library to *build* (not merely to run) would
+    otherwise fail there before this ever got a chance to run.
+
+    "--no-install-recommends" keeps apt from silently pulling in every
+    recommended-but-optional package alongside each one actually
+    requested; removing /var/lib/apt/lists afterward keeps the
+    downloaded package index out of the final image layer -- the same
+    "don't ship what the running app never needs" reasoning
+    PYTHONDONTWRITEBYTECODE (below) already follows for this file's own
+    bytecode cache, just applied to apt's own leftover state instead.
+    """
+    if not apt_packages:
+        return ""
+
+    package_list = " ".join(apt_packages)
+
+    return f"""\
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    {package_list} \\
+    && rm -rf /var/lib/apt/lists/*
+
+"""
+
+
 def dockerfile_content(
     package_name="generated",
     python_version="3.11",
+    apt_packages=None,
 ):
     """The exact Dockerfile text generate_dockerfile (below) writes to
     disk, as a pure string -- no filesystem access at all.
@@ -18,6 +60,14 @@ def dockerfile_content(
     without touching disk" split extract_third_party_imports/
     resolve_requirements already give write_requirements, and
     generate_fastapi_code already gives write_generated_api.
+
+    `apt_packages` (optional, see apt_install_content above for what it's
+    for and why) is a notebook's own explicit "# notebook-to-api:
+    apt-requires" directives -- omitted (the default) or empty produces
+    byte-for-byte the same Dockerfile this function already wrote before
+    this parameter existed, so every existing caller (and every notebook
+    with no such directive, still the overwhelming majority) is
+    unaffected.
     """
 
     return f"""\
@@ -45,7 +95,7 @@ FROM python:{python_version}-slim
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-WORKDIR /app
+{apt_install_content(apt_packages)}WORKDIR /app
 
 # Copy requirements first for Docker layer caching
 COPY requirements.txt .
@@ -95,6 +145,7 @@ def generate_dockerfile(
     output_path="generated/Dockerfile",
     package_name="generated",
     python_version="3.11",
+    apt_packages=None,
 ):
     """Write a Dockerfile for the compiled app at `output_path`.
 
@@ -110,9 +161,12 @@ def generate_dockerfile(
     don't cover that Python version, or fall back to a source build that
     behaves differently from what was actually resolved and tested
     locally.
+
+    `apt_packages` -- see dockerfile_content's own docstring for what
+    this is and why it exists; passed straight through unchanged.
     """
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(dockerfile_content(package_name, python_version))
+        f.write(dockerfile_content(package_name, python_version, apt_packages))
 
     print(f"Dockerfile generated at: {output_path}")
 

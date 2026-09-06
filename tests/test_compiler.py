@@ -18,6 +18,7 @@ from backend.compiler import (
     _drop_private_functions,
     _explicit_requirement_package_name,
     _extract_excluded_imports,
+    _extract_explicit_apt_packages,
     _extract_explicit_requirements,
     _extract_private_function_names,
     _filter_functions_by_name,
@@ -33,7 +34,9 @@ from backend.compiler import (
     THIS_TOOLS_OWN_PACKAGE_NAME,
 )
 from backend.generator.docker_generator import (
+    apt_install_content,
     docker_compose_content,
+    dockerfile_content,
     env_example_content,
     generate_dockerfile,
     generate_dockerignore,
@@ -337,6 +340,71 @@ def test_generate_dockerfile_uses_the_given_python_version(tmp_path):
     generate_dockerfile(str(output_path), "generated", python_version="3.12")
 
     assert "FROM python:3.12-slim" in output_path.read_text(encoding="utf-8")
+
+
+def test_apt_install_content_is_empty_for_no_packages():
+
+    assert apt_install_content(None) == ""
+    assert apt_install_content([]) == ""
+
+
+def test_apt_install_content_lists_every_package_on_one_line():
+
+    content = apt_install_content(["libpq-dev", "gcc"])
+
+    assert "RUN apt-get update && apt-get install -y --no-install-recommends" in content
+    assert "libpq-dev gcc" in content
+    assert "rm -rf /var/lib/apt/lists/*" in content
+
+
+def test_dockerfile_content_omits_apt_block_by_default():
+    """The overwhelming majority of notebooks use no "apt-requires"
+    directive at all -- the generated Dockerfile for one of them must be
+    byte-for-byte identical to what dockerfile_content already produced
+    before this parameter existed.
+    """
+
+    without_param = dockerfile_content("generated", "3.12")
+    with_empty_list = dockerfile_content("generated", "3.12", apt_packages=[])
+    with_none = dockerfile_content("generated", "3.12", apt_packages=None)
+
+    assert without_param == with_empty_list == with_none
+    assert "apt-get" not in without_param
+
+
+def test_dockerfile_content_includes_apt_block_before_pip_install():
+    """A system library needed to *build* a pip package (not merely to
+    run it) must already be present before `pip install` runs, or the
+    build itself fails with nothing installed yet to fix it.
+    """
+
+    content = dockerfile_content("generated", "3.12", apt_packages=["libpq-dev"])
+
+    assert "libpq-dev" in content
+    assert content.index("apt-get install") < content.index("pip install")
+
+
+def test_dockerfile_content_apt_block_matches_apt_install_content():
+
+    apt_packages = ["libpq-dev", "gcc"]
+
+    full_dockerfile = dockerfile_content("generated", "3.12", apt_packages)
+
+    assert apt_install_content(apt_packages) in full_dockerfile
+
+
+def test_generate_dockerfile_writes_the_apt_block_when_given_packages(tmp_path):
+
+    output_path = tmp_path / "Dockerfile"
+
+    generate_dockerfile(
+        str(output_path), "generated", python_version="3.12",
+        apt_packages=["libpq-dev"],
+    )
+
+    content = output_path.read_text(encoding="utf-8")
+    assert "apt-get install -y --no-install-recommends" in content
+    assert "libpq-dev" in content
 
 
 def test_compiler_pipeline_dockerfile_base_image_matches_the_compiling_interpreter(
@@ -687,6 +755,61 @@ def test_env_example_content_produces_a_value_that_can_actually_be_parsed_as_env
         "NOTEBOOK_API_KEY=dev-key",
         "NOTEBOOK_API_MAX_TASKS=10000",
     ]
+
+
+def test_compiler_pipeline_writes_apt_requires_directive_into_the_dockerfile(
+    tmp_path
+):
+    """Confirmed missing before this feature: a notebook whose own
+    dependency needs a system package present inside the image (e.g.
+    `psycopg2` needing libpq-dev to build, or `opencv-python` needing
+    libgl1 present at runtime) had exactly one path to a working image --
+    hand-editing the generated Dockerfile after every single compile,
+    since compile_notebook_to_api's own generate_dockerfile call never
+    knew about anything beyond `pip install`.
+    """
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.cells.append(
+        nbformat.v4.new_code_cell(
+            "# notebook-to-api: apt-requires libpq-dev\n"
+            "def add(a: int, b: int) -> int:\n    return a + b\n"
+        )
+    )
+
+    notebook_path = tmp_path / "nb.ipynb"
+    with open(notebook_path, "w", encoding="utf-8") as f:
+        nbformat.write(notebook, f)
+
+    output_dir = tmp_path / "generated"
+    compile_notebook(str(notebook_path), str(output_dir))
+
+    dockerfile = (output_dir / "Dockerfile").read_text(encoding="utf-8")
+    assert "apt-get install -y --no-install-recommends" in dockerfile
+    assert "libpq-dev" in dockerfile
+    assert dockerfile.index("apt-get install") < dockerfile.index("pip install")
+
+
+def test_compiler_pipeline_omits_apt_block_for_a_notebook_with_no_directive(
+    tmp_path
+):
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.cells.append(
+        nbformat.v4.new_code_cell(
+            "def add(a: int, b: int) -> int:\n    return a + b\n"
+        )
+    )
+
+    notebook_path = tmp_path / "nb.ipynb"
+    with open(notebook_path, "w", encoding="utf-8") as f:
+        nbformat.write(notebook, f)
+
+    output_dir = tmp_path / "generated"
+    compile_notebook(str(notebook_path), str(output_dir))
+
+    dockerfile = (output_dir / "Dockerfile").read_text(encoding="utf-8")
+    assert "apt-get" not in dockerfile
 
 
 def test_compiler_pipeline_generates_a_docker_compose_file(tmp_path):
@@ -6634,6 +6757,101 @@ def test_extract_explicit_requirements_returns_an_empty_list_with_no_directives(
     code_cells = ["import pandas\n\ndef f() -> int:\n    return 1\n"]
 
     assert _extract_explicit_requirements(code_cells) == []
+
+
+def test_extract_explicit_apt_packages_finds_a_directive_in_a_cell():
+
+    code_cells = [
+        "# notebook-to-api: apt-requires libpq-dev\n"
+        "import psycopg2\n"
+    ]
+
+    assert _extract_explicit_apt_packages(code_cells) == ["libpq-dev"]
+
+
+def test_extract_explicit_apt_packages_finds_a_directive_indented_inside_a_function():
+
+    code_cells = [
+        "def f() -> int:\n"
+        "    # notebook-to-api: apt-requires libgl1\n"
+        "    return 1\n"
+    ]
+
+    assert _extract_explicit_apt_packages(code_cells) == ["libgl1"]
+
+
+def test_extract_explicit_apt_packages_supports_a_version_pin():
+
+    code_cells = [
+        "# notebook-to-api: apt-requires libpq-dev=13.11-0+deb12u1\n"
+    ]
+
+    assert _extract_explicit_apt_packages(code_cells) == [
+        "libpq-dev=13.11-0+deb12u1"
+    ]
+
+
+def test_extract_explicit_apt_packages_deduplicates_exact_matches_across_cells():
+
+    code_cells = [
+        "# notebook-to-api: apt-requires libpq-dev\n",
+        "# notebook-to-api: apt-requires libpq-dev\n",
+    ]
+
+    assert _extract_explicit_apt_packages(code_cells) == ["libpq-dev"]
+
+
+def test_extract_explicit_apt_packages_preserves_first_seen_order_across_cells():
+
+    code_cells = [
+        "# notebook-to-api: apt-requires libpq-dev\n",
+        "# notebook-to-api: apt-requires libgl1\n",
+    ]
+
+    assert _extract_explicit_apt_packages(code_cells) == ["libpq-dev", "libgl1"]
+
+
+def test_extract_explicit_apt_packages_allows_two_different_pins_for_the_same_package():
+    """Unlike _extract_explicit_requirements' own "requires" directive,
+    apt-get itself doesn't hard-fail on two mentions of the same package
+    -- it simply installs whichever comes last -- so there is no
+    equivalent conflict to raise for here.
+    """
+
+    code_cells = [
+        "# notebook-to-api: apt-requires libpq-dev=1.0\n"
+        "# notebook-to-api: apt-requires libpq-dev=2.0\n"
+    ]
+
+    assert _extract_explicit_apt_packages(code_cells) == [
+        "libpq-dev=1.0", "libpq-dev=2.0",
+    ]
+
+
+def test_extract_explicit_apt_packages_ignores_an_unrelated_comment():
+
+    code_cells = [
+        "# this notebook-to-api project requires careful review\n"
+        "import pandas\n"
+    ]
+
+    assert _extract_explicit_apt_packages(code_cells) == []
+
+
+def test_extract_explicit_apt_packages_does_not_match_the_requires_directive():
+
+    code_cells = [
+        "# notebook-to-api: requires psycopg2==2.9.9\n"
+    ]
+
+    assert _extract_explicit_apt_packages(code_cells) == []
+
+
+def test_extract_explicit_apt_packages_returns_an_empty_list_with_no_directives():
+
+    code_cells = ["import pandas\n\ndef f() -> int:\n    return 1\n"]
+
+    assert _extract_explicit_apt_packages(code_cells) == []
 
 
 def test_extract_explicit_requirements_raises_for_conflicting_specs_in_the_same_cell():

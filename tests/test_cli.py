@@ -12232,6 +12232,70 @@ def test_dockerfile_preview_command_prints_the_dockerfile(tmp_path, fake_dashboa
     assert handler.requests == ["/api/dockerfile-preview"]
 
 
+def test_dockerfile_preview_command_passes_filename_and_version_id_through(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success",
+            "package_name": "generated",
+            "compiling_python_version": "3.12",
+            "dockerfile": "FROM python:3.12-slim\n\nRUN apt-get install libpq-dev\n",
+            "dockerignore": ".git/\n",
+            "notebook": "nb.ipynb",
+            "version_id": "v1.ipynb",
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        [
+            "dockerfile-preview", "nb.ipynb",
+            "--version-id", "v1.ipynb",
+            "--dashboard-url", dashboard_url,
+        ],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "libpq-dev" in proc.stdout
+    assert "for 'nb.ipynb' on" in proc.stdout
+    assert handler.requests == [
+        "/api/dockerfile-preview?notebook_path=nb.ipynb&version_id=v1.ipynb"
+    ]
+
+
+def test_dockerfile_preview_command_omits_query_params_without_a_filename(
+    tmp_path, fake_dashboard
+):
+
+    dashboard_url, handler = fake_dashboard
+    handler.responses = [
+        _json_response(200, {
+            "status": "success",
+            "package_name": "generated",
+            "compiling_python_version": "3.12",
+            "dockerfile": "FROM python:3.12-slim\n",
+            "dockerignore": ".git/\n",
+        })
+    ]
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = _run_cli(
+        ["dockerfile-preview", "--dashboard-url", dashboard_url],
+        cwd=workdir,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert handler.requests == ["/api/dockerfile-preview"]
+
+
 def test_dockerfile_preview_command_json_flag_emits_the_dashboards_own_response(
     tmp_path, fake_dashboard
 ):

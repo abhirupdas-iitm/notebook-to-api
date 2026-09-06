@@ -19418,6 +19418,115 @@ def test_dockerfile_preview_does_not_touch_generated_dir(monkeypatch, tmp_path):
     assert not generated_dir.exists()
 
 
+def test_dockerfile_preview_reflects_an_apt_requires_directive():
+
+    content = _notebook_bytes(
+        "# notebook-to-api: apt-requires libpq-dev\n"
+        "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+
+    upload_resp = client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "dockerfile_preview_apt.ipynb",
+                io.BytesIO(content),
+                "application/json",
+            )
+        },
+    )
+    assert upload_resp.status_code == 200
+
+    resp = client.get(
+        "/api/dockerfile-preview",
+        params={"notebook_path": "dockerfile_preview_apt.ipynb"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["notebook"] == "dockerfile_preview_apt.ipynb"
+    assert "apt-get install -y --no-install-recommends" in body["dockerfile"]
+    assert "libpq-dev" in body["dockerfile"]
+
+
+def test_dockerfile_preview_without_notebook_path_omits_apt_packages():
+    """Confirmed missing before this feature: this endpoint's own
+    "dockerfile" field was silently wrong (missing the apt-get line
+    entirely) for a notebook using the directive -- the exact "preview
+    drifts from what a real compile would actually produce" failure
+    every other preview endpoint in this file already guards against.
+    Without "notebook_path" at all, the response must stay exactly what
+    it was before this parameter existed.
+    """
+
+    resp = client.get("/api/dockerfile-preview")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["notebook"] is None
+    assert "apt-get" not in body["dockerfile"]
+
+
+def test_dockerfile_preview_apt_requires_matches_what_an_actual_compile_writes():
+
+    filename = "dockerfile_preview_apt_match.ipynb"
+    content = _notebook_bytes(
+        "# notebook-to-api: apt-requires libpq-dev\n"
+        "def add(a: int, b: int) -> int:\n    return a + b\n"
+    )
+    client.post(
+        "/api/upload",
+        files={"file": (filename, io.BytesIO(content), "application/json")},
+    )
+
+    preview_resp = client.get(
+        "/api/dockerfile-preview", params={"notebook_path": filename}
+    )
+    assert preview_resp.status_code == 200
+
+    compile_resp = client.post("/api/compile", json={"notebook_path": filename})
+    assert compile_resp.status_code == 200
+
+    actual_dockerfile = client.get("/api/generated/Dockerfile").json()["content"]
+
+    assert preview_resp.json()["dockerfile"] == actual_dockerfile
+
+
+def test_dockerfile_preview_rejects_a_malformed_notebook():
+
+    filename = "dockerfile_preview_malformed.ipynb"
+    file_path = os.path.join(UPLOAD_DIR, filename)
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("not valid json at all")
+
+    resp = client.get(
+        "/api/dockerfile-preview", params={"notebook_path": filename}
+    )
+
+    assert resp.status_code == 400
+
+
+def test_dockerfile_preview_returns_404_for_a_missing_notebook():
+
+    resp = client.get(
+        "/api/dockerfile-preview",
+        params={"notebook_path": "does_not_exist.ipynb"},
+    )
+
+    assert resp.status_code == 404
+
+
+def test_dockerfile_preview_rejects_version_id_without_notebook_path():
+
+    resp = client.get(
+        "/api/dockerfile-preview", params={"version_id": "some-version.ipynb"}
+    )
+
+    assert resp.status_code == 400
+    assert "version_id requires notebook_path" in resp.json()["detail"]
+
+
 def test_docker_compose_preview_requires_no_notebook_and_needs_no_body():
 
     resp = client.get("/api/docker-compose-preview")

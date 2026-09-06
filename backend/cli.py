@@ -4386,9 +4386,16 @@ def _dispatch_core_command(args):
 
         dashboard_url = args.dashboard_url.rstrip("/")
 
+        params = {}
+        if args.filename:
+            params["notebook_path"] = args.filename
+        if args.version_id:
+            params["version_id"] = args.version_id
+
         try:
             response = httpx.get(
                 f"{dashboard_url}/api/dockerfile-preview",
+                params=params,
                 timeout=args.timeout,
             )
         except httpx.HTTPError as exc:
@@ -4406,8 +4413,12 @@ def _dispatch_core_command(args):
         if args.json_output:
             print(json.dumps(data, indent=2))
         else:
+            target = (
+                f"'{data['notebook']}' on {dashboard_url}"
+                if data.get("notebook") else dashboard_url
+            )
             print(
-                f"Dockerfile preview for {dashboard_url} "
+                f"Dockerfile preview for {target} "
                 f"(package '{data.get('package_name')}', "
                 f"Python {data.get('compiling_python_version')}):\n"
             )
@@ -9291,9 +9302,12 @@ def main():
     # dockerfile-preview command (preview the Dockerfile/.dockerignore a
     # compile on a running dashboard would produce, via its own GET
     # /api/dockerfile-preview -- unlike requirements-preview/app-preview/
-    # curl-preview, takes no notebook argument at all: neither artifact
-    # varies by notebook, only by this dashboard's own configured output
-    # directory name and compiling interpreter)
+    # curl-preview, "filename" is optional: neither artifact varies by
+    # notebook for the overwhelming majority of them, only by this
+    # dashboard's own configured output directory name and compiling
+    # interpreter -- except a notebook using its own "# notebook-to-api:
+    # apt-requires" directive, which is exactly what passing "filename"
+    # here is for)
     dockerfile_preview_parser = subparsers.add_parser(
         "dockerfile-preview",
         help=(
@@ -9302,7 +9316,22 @@ def main():
             "/api/dockerfile-preview -- without compiling anything."
         )
     )
+    dockerfile_preview_parser.add_argument(
+        "filename",
+        nargs="?",
+        default=None,
+        help=(
+            "Filename of a notebook already uploaded to the dashboard, "
+            "as reported by `list` -- only needed to reflect that "
+            "notebook's own \"# notebook-to-api: apt-requires\" "
+            "directives (see GET /api/dockerfile-preview's own "
+            "\"notebook_path\" query parameter); omitted, the preview is "
+            "identical for every notebook that uses no such directive, "
+            "which is most of them."
+        )
+    )
     _add_dashboard_url_and_timeout_arguments(dockerfile_preview_parser)
+    _add_version_id_argument(dockerfile_preview_parser, "GET /api/dockerfile-preview")
     dockerfile_preview_parser.add_argument(
         "--json",
         action="store_true",
@@ -9310,8 +9339,9 @@ def main():
         help=(
             "Emit the dashboard's own JSON response ({\"status\", "
             "\"package_name\", \"compiling_python_version\", "
-            "\"dockerfile\", \"dockerignore\"}) instead of a "
-            "human-readable preview, for scripting/automation."
+            "\"dockerfile\", \"dockerignore\", \"notebook\", "
+            "\"version_id\"}) instead of a human-readable preview, for "
+            "scripting/automation."
         )
     )
 

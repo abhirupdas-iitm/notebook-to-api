@@ -40,6 +40,7 @@ from backend.compiler import (
     NOTEBOOK_TO_API_VERSION,
     _drop_private_functions,
     _extract_excluded_imports,
+    _extract_explicit_apt_packages,
     _extract_explicit_requirements,
     _filter_functions_by_name,
     _generated_files_sha256,
@@ -10969,7 +10970,7 @@ def postman_preview_endpoint(data: dict):
 
 
 @router.get("/dockerfile-preview")
-def dockerfile_preview_endpoint():
+def dockerfile_preview_endpoint(notebook_path: str = None, version_id: str = None):
     """The exact Dockerfile and .dockerignore text POST /api/compile
     would write for whatever notebook is next compiled -- without
     actually compiling anything, or touching GENERATED_DIR (or whatever
@@ -10978,13 +10979,16 @@ def dockerfile_preview_endpoint():
     POST /api/requirements-preview, POST /api/app-preview, and POST
     /api/curl-preview already let a caller preview a compile's other
     artifacts ahead of time, each keyed to one particular notebook's own
-    cells -- but the Dockerfile isn't: generate_dockerfile (backend/
-    generator/docker_generator.py) only ever depends on this dashboard's
-    own fixed "package_name" (package_name_for_output_dir(GENERATED_DIR),
-    the same directory name every compile targets) and
+    cells -- the Dockerfile mostly isn't: generate_dockerfile (backend/
+    generator/docker_generator.py) depends only on this dashboard's own
+    fixed "package_name" (package_name_for_output_dir(GENERATED_DIR), the
+    same directory name every compile targets) and
     compiling_python_version() (the interpreter this dashboard process is
-    actually running under) -- never on which notebook is being compiled.
-    GET /api/config's own docstring already surfaces
+    actually running under) for the overwhelming majority of notebooks --
+    never on which notebook is being compiled -- which is why
+    "notebook_path" (optional query parameter, unlike every POST-with-a-
+    body preview endpoint in this file) is exactly that: optional. GET
+    /api/config's own docstring already surfaces
     "compiling_python_version" and says as much: a caller wanting to know
     which Python version a compile would target, "to sanity-check a
     pinned dependency's own wheel availability before compiling", had "no
@@ -10992,10 +10996,27 @@ def dockerfile_preview_endpoint():
     reading the resulting Dockerfile (or GET /api/generated/Dockerfile)
     back afterward" -- mutating GENERATED_DIR, and whatever it currently
     backs for every other caller of this dashboard, just to answer a
-    question that doesn't require compiling anything at all. This closes
-    that exact gap: no notebook_path needed (no compile's Dockerfile has
-    ever varied by one), a plain no-argument GET rather than a POST with
-    a JSON body, since this needs no input at all.
+    question that doesn't require compiling anything at all. Omitting
+    "notebook_path" entirely preserves that exact "no input needed" shape
+    unchanged.
+
+    "notebook_path" (optional, with "version_id" exactly like every other
+    preview endpoint's own -- see _resolve_preview_content_path) is only
+    needed at all because of one real exception to "never varies by
+    notebook": a "# notebook-to-api: apt-requires <package>" directive
+    (see _extract_explicit_apt_packages, backend/compiler.py) adds a
+    system-package "RUN apt-get install" line to the generated Dockerfile
+    that -- unlike everything else in it -- genuinely does depend on the
+    specific notebook being compiled. Before this parameter existed, this
+    endpoint's own "dockerfile" field was silently wrong (missing that
+    line entirely) for any notebook using the directive, the exact
+    "preview drifts from what a real compile would actually produce"
+    failure mode every other preview endpoint in this file already
+    guards against for its own artifact. Given, the preview reflects that
+    notebook's own directives; omitted (the default), "apt_packages" is
+    empty and the response is identical to before this parameter existed
+    -- correct for the overwhelming majority of notebooks, which use no
+    such directive at all.
 
     Reuses dockerfile_content/dockerignore_content directly -- the same
     pure string-building helpers generate_dockerfile/generate_dockerignore
@@ -11010,12 +11031,45 @@ def dockerfile_preview_endpoint():
     package_name = package_name_for_output_dir(GENERATED_DIR)
     python_version = compiling_python_version()
 
+    apt_packages = []
+
+    if notebook_path:
+
+        full_path = _resolve_preview_content_path(notebook_path, version_id)
+
+        try:
+
+            notebook = load_notebook(str(full_path))
+
+        except MALFORMED_NOTEBOOK_ERRORS as e:
+
+            raise HTTPException(
+                status_code=400,
+                detail=f"Uploaded file is not a valid Jupyter notebook: {e}"
+            )
+
+        code_cells = [
+            cell for cell in extract_code_cells(notebook)
+            if is_parseable_python(cell)
+        ]
+
+        apt_packages = _extract_explicit_apt_packages(code_cells)
+
+    elif version_id:
+
+        raise HTTPException(
+            status_code=400,
+            detail="version_id requires notebook_path"
+        )
+
     return {
         "status": "success",
         "package_name": package_name,
         "compiling_python_version": python_version,
-        "dockerfile": dockerfile_content(package_name, python_version),
+        "dockerfile": dockerfile_content(package_name, python_version, apt_packages),
         "dockerignore": dockerignore_content(),
+        "notebook": notebook_path,
+        "version_id": version_id,
     }
 
 
